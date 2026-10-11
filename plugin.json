@@ -1,0 +1,14 @@
+{
+  "id": "token-meter",
+  "name": "Token 计岛",
+  "version": "1.0.0",
+  "entry_dll": "TokenMeter.dll",
+  "api_version": 2,
+  "min_host_version": "2.4.0",
+  "description": "实时显示token用量与费用、今日花费与明细、能展开近7天趋势。只读本机会话日志，不联网。",
+  "author": "KujouShiori",
+  "homepage": "https://github.com/KujouShiori/token-meter",
+  "icon_glyph": "\uE8EF",
+  "license": "MIT",
+  "tags": ["ai", "token", "cost", "monitor"]
+}

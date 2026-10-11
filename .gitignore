@@ -1,0 +1,11 @@
+bin/
+obj/
+dist/
+*.user
+.vs/
+
+# 本机专用覆盖项（含本机宿主路径），不随源码发布
+Directory.Build.props
+
+# 运行时扫描缓存（正常落在宿主 plugins 目录内，防呆）
+.cache/
