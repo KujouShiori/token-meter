@@ -649,10 +649,12 @@ public sealed class TokenMeterPlugin : IslandPluginBase
             AcceptsReturn = true,
             TextWrapping = TextWrapping.Wrap,
             MinWidth = 640,
-            MinHeight = 96,
+            MinHeight = 220,
             FontFamily = new FontFamily("Consolas, Cascadia Mono"),
+            Visibility = Visibility.Collapsed,
         };
         var jsonStatus = new TextBlock { FontSize = 12, Opacity = 0.8, TextWrapping = TextWrapping.Wrap };
+        var jsonToggle = new Button { Content = "展开编辑完整配置 JSON" };
 
         void CommitProviderJson()
         {
@@ -675,7 +677,28 @@ public sealed class TokenMeterPlugin : IslandPluginBase
             jsonStatus.Text = "已保存并重新拉取。";
         }
         jsonBox.LostFocus += (_, _) => CommitProviderJson();
-        page.Children.Add(Card(jsonBox));
+
+        // 默认收起：整份 JSON 平铺在页面上既占地方也容易误改，点按钮才展开编辑
+        jsonToggle.Click += (_, _) =>
+        {
+            if (jsonBox.Visibility == Visibility.Visible)
+            {
+                CommitProviderJson();          // 收起前先落盘，不依赖 LostFocus
+                jsonBox.Visibility = Visibility.Collapsed;
+                jsonToggle.Content = "展开编辑完整配置 JSON";
+            }
+            else
+            {
+                // 每次展开都从设置里重读，避免刚才用上面那些单字段框改过之后看到旧内容
+                jsonBox.Text = ProviderConfig.Parse(Settings.Get("provider", string.Empty)).ToJson();
+                jsonBox.Visibility = Visibility.Visible;
+                jsonToggle.Content = "保存并收起";
+                jsonBox.Focus(FocusState.Programmatic);
+            }
+        };
+
+        page.Children.Add(jsonToggle);
+        page.Children.Add(jsonBox);
         page.Children.Add(jsonStatus);
 
         // ---- 模型单价表 ----
