@@ -470,7 +470,7 @@ public sealed class TokenMeterPlugin : IslandPluginBase
 
         page.Children.Add(new TextBlock
         {
-            Text = "费用是按你填的单价算出来的：会话记录里的 cost 全是 0，只有 token 数是真实的。没配单价的模型会被标成「未定价」。",
+            Text = "费用是按你填的单价算出来的，没设置单价的模型会被标成「未定价」。",
             FontSize = 12,
             TextWrapping = TextWrapping.Wrap,
             Opacity = 0.75,
