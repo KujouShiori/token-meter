@@ -82,7 +82,7 @@ public sealed class UsageScanner
         _cachePath = Path.Combine(cacheDir, "scan-cache-v1.json");
     }
 
-    /// <summary>本机默认数据根目录：SCNet 客户端的项目会话目录。</summary>
+    /// <summary>本机默认数据根目录：本地 AI 客户端的项目会话目录。</summary>
     public static string DefaultRoot()
     {
         var profile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);

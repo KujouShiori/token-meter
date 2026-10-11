@@ -43,6 +43,7 @@ public sealed class TokenMeterSpotlightView : UserControl
     private readonly TextBlock _kpiHit;
     private readonly StackPanel _bars;
     private readonly StackPanel _table;
+    private readonly TextBlock _source;
     private readonly Button _refresh;
 
     private readonly SolidColorBrush _textBrush = new();
@@ -111,6 +112,8 @@ public sealed class TokenMeterSpotlightView : UserControl
         _table = new StackPanel { Spacing = S(2) };
         var tableLabel = new TextBlock { Text = "今日逐模型明细", FontSize = D(13), Foreground = _mutedBrush };
 
+        _source = new TextBlock { FontSize = T(11), Foreground = _faintBrush, TextWrapping = TextWrapping.Wrap };
+
         var root = new StackPanel
         {
             Spacing = S(14),
@@ -119,6 +122,7 @@ public sealed class TokenMeterSpotlightView : UserControl
             Background = new SolidColorBrush(Microsoft.UI.Colors.Transparent),
         };
         root.Children.Add(titleRow);
+        root.Children.Add(_source);
         root.Children.Add(Divider());
         root.Children.Add(kpiRow);
         root.Children.Add(Divider());
@@ -196,6 +200,12 @@ public sealed class TokenMeterSpotlightView : UserControl
 
         var cur = s.Currency;
         var todayPriced = s.Today.Models - s.Today.UnpricedModels;
+
+        // 口径变了必须看得出来：接口挂了在后台静默降级比报错更难发现
+        _source.Text = s.SourceMode + (s.CoveredUntilUtc is null
+            ? string.Empty
+            : $"（服务端覆盖到 {Format.Ago(s.CoveredUntilUtc.Value)}）")
+            + (string.IsNullOrEmpty(s.ProviderNote) ? string.Empty : " · " + s.ProviderNote);
 
         _kpiTodayCost.Text = s.HasData
             ? (todayPriced > 0 ? Format.Money(cur, s.Today.Cost) : "未定价")

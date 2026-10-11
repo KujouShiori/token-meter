@@ -106,6 +106,17 @@ public sealed class Snapshot
     public List<string> UnpricedNames { get; set; } = new();
 
     public string RootDescription { get; set; } = "";
+
+    /// <summary>当前数字的来源：本地日志 / 服务端 / 混合。口径变了必须让用户看得见。</summary>
+    public string SourceMode { get; set; } = "本地日志";
+    public string ProviderSummary { get; set; } = "";
+    public string ProviderNote { get; set; } = "";
+    /// <summary>服务端数据可信到哪一刻（已扣滞后带），之后的时间继续用本地日志。</summary>
+    public DateTime? CoveredUntilUtc { get; set; }
+    /// <summary>服务端比本地少超阈值：多半是 Key 权限覆盖不全，界面要标警告。</summary>
+    public bool ServerUndercount { get; set; }
+    public string UndercountDetail { get; set; } = "";
+
     public int Files { get; set; }
     public long ScannedBytes { get; set; }
     public int LedgerDays { get; set; }
@@ -135,6 +146,44 @@ public sealed class UsageLedger
             return;
         }
         existing.Add(c);
+    }
+
+    /// <summary>
+    /// 用 incoming 的整天数据直接覆盖同一天。服务端接口按天分桶返回，
+    /// 重复拉同一天时「覆盖」才是对的，「累加」会把同一天的用量翻倍。
+    /// </summary>
+    public void MergeOverwrite(UsageLedger incoming)
+    {
+        foreach (var (dayKey, byModel) in incoming.Days)
+        {
+            var clone = new Dictionary<string, Counters>(StringComparer.OrdinalIgnoreCase);
+            foreach (var (model, c) in byModel) clone[model] = c.Clone();
+            Days[dayKey] = clone;
+        }
+    }
+
+    public long TotalTokens()
+    {
+        long acc = 0;
+        foreach (var byModel in Days.Values)
+            foreach (var c in byModel.Values)
+                acc += c.Total;
+        return acc;
+    }
+
+    public UsageLedger Clone()
+    {
+        var copy = new UsageLedger
+        {
+            ScannedBytes = ScannedBytes,
+            Files = Files,
+            RootDescription = RootDescription,
+            Note = Note,
+        };
+        foreach (var (dayKey, byModel) in Days)
+            foreach (var (model, c) in byModel)
+                copy.Add(dayKey, model, c);
+        return copy;
     }
 
     public IEnumerable<string> AllModels()

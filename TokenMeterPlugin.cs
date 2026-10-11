@@ -1,3 +1,5 @@
+using System.Globalization;
+using System.Text.Json;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Microsoft.UI.Xaml.Media;
@@ -23,6 +25,12 @@ public sealed class TokenMeterPlugin : IslandPluginBase
     private UsageLedger? _lastLedger;
     private Snapshot? _lastSnapshot;
 
+    /// <summary>服务端账本：按天累加，同一轮里只往水位线后面追，不重复拉。</summary>
+    private UsageLedger? _serverLedger;
+    private DateTime? _coveredUntilUtc;
+    private ProviderState _providerState = new();
+    private string _cacheDir = string.Empty;
+
     private readonly SemaphoreSlim _gate = new(1, 1);
     private CancellationTokenSource _cts = new();
     private bool _stopped;
@@ -44,7 +52,10 @@ public sealed class TokenMeterPlugin : IslandPluginBase
         // 不会在 %LOCALAPPDATA% 留下残留文件（市场审核标准第一条）。
         // 只有插件目录真的不可写时才退回 %LOCALAPPDATA%，并在日志里明说。
         var cacheDir = ResolveCacheDir();
+        _cacheDir = cacheDir;
         _scanner = new UsageScanner(cacheDir);
+        _providerState = LoadProviderState();
+        _coveredUntilUtc = _providerState.CoveredUntilUtc;
 
         _view = new TokenMeterView(Manifest, Theme);
         _view.SetScanning(true);
@@ -58,6 +69,7 @@ public sealed class TokenMeterPlugin : IslandPluginBase
         Context.Register(Context.OnSettingsChanged("priority", OnPriorityChanged));
         Context.Register(Context.OnSettingsChanged("pricing", OnPricingChanged));
         Context.Register(Context.OnSettingsChanged("roots", () => _ = RefreshAsync("数据目录变更")));
+        Context.Register(Context.OnSettingsChanged("provider", OnProviderConfigChanged));
         Context.Register(Context.OnSettingsChanged("refreshSeconds", () => { _secondsSinceRefresh = 0; }));
 
         if (Settings.Get("enabled", true)) SetContent(_content);
@@ -158,16 +170,68 @@ public sealed class TokenMeterPlugin : IslandPluginBase
             var token = _cts.Token;
 
             Snapshot snap;
+            var providerJson = Settings.Get("provider", string.Empty);
             try
             {
-                snap = await Task.Run(() =>
+                snap = await Task.Run(async () =>
                 {
                     token.ThrowIfCancellationRequested();
-                    var ledger = _scanner.Scan(roots, token);
-                    // 停用/卸载中不再落盘，避免把缓存目录重新建回来
+
+                    // 本地日志始终先扫：它既是默认数据源，也是接口挂掉时的兜底
+                    var local = _scanner.Scan(roots, token);
                     if (!_stopped) _scanner.SaveCache();
-                    lock (_ledgerLock) { _lastLedger = ledger; }
-                    return SnapshotBuilder.Build(ledger, pricing);
+
+                    var cfg = ProviderConfig.Parse(providerJson);
+                    if (!cfg.Enabled)
+                    {
+                        // 用户主动关掉接口：不能拿旧的服务端数据去压制本地日志
+                        _serverLedger = null;
+                        _coveredUntilUtc = null;
+                    }
+
+                    var note = string.Empty;
+                    if (cfg.Enabled)
+                    {
+                        if (cfg.IsUsable(out var why))
+                        {
+                            try
+                            {
+                                await PullProviderAsync(cfg, token).ConfigureAwait(false);
+                            }
+                            catch (OperationCanceledException) { throw; }
+                            catch (ProviderException ex)
+                            {
+                                note = "接口不可用，已降级本地日志：" + ex.Message;
+                                RememberProviderFailure(note);
+                            }
+                            catch (Exception ex)
+                            {
+                                note = "接口异常，已降级本地日志：" + ex.Message;
+                                RememberProviderFailure(note);
+                            }
+                        }
+                        else
+                        {
+                            note = "接口未就绪（已降级本地日志）：" + why;
+                            RememberProviderFailure(note);
+                        }
+                    }
+
+                    var (effective, info) = LedgerMerger.Merge(
+                        local, _serverLedger, _coveredUntilUtc, cfg.UndercountWarnPercent);
+
+                    var s = SnapshotBuilder.Build(effective, pricing);
+                    s.RootDescription = local.RootDescription;
+                    s.Files = local.Files;
+                    s.ScannedBytes = local.ScannedBytes;
+                    s.SourceMode = info.Mode;
+                    s.ProviderSummary = cfg.Enabled ? cfg.SafeSummary() : "服务端接口未启用";
+                    s.CoveredUntilUtc = info.CoveredUntilUtc;
+                    s.ServerUndercount = info.Undercount;
+                    s.ProviderNote = info.Undercount ? info.UndercountDetail : note;
+
+                    lock (_ledgerLock) { _lastLedger = effective; }
+                    return s;
                 }, token).ConfigureAwait(false);
             }
             catch (OperationCanceledException)
@@ -197,6 +261,99 @@ public sealed class TokenMeterPlugin : IslandPluginBase
     }
 
     private readonly object _ledgerLock = new();
+
+    // ---------------- 服务端用量接口 ----------------
+
+    /// <summary>
+    /// 从水位线滚到「现在 - 滞后带」：跨度超过 WindowMaxDays 就切段，
+    /// 每段内部把分页翻完；一轮最多 MaxWindowsPerRun 段，避免首次同步把界面卡死。
+    /// </summary>
+    private async Task PullProviderAsync(ProviderConfig cfg, CancellationToken ct)
+    {
+        var nowUtc = DateTime.UtcNow;
+        var plan = ProviderClient.PlanWindows(_coveredUntilUtc, nowUtc, cfg);
+        var merged = _serverLedger?.Clone() ?? new UsageLedger();
+        var windows = 0;
+        var pages = 0;
+        long bytes = 0;
+
+        using var client = new ProviderClient(cfg.TimeoutSeconds);
+        foreach (var (from, to) in plan)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            var r = await client.FetchAsync(cfg, from, to, ct).ConfigureAwait(false);
+            merged.MergeOverwrite(r.Ledger);
+            windows++;
+            pages += r.Pages;
+            bytes += r.BytesIn;
+        }
+
+        var advanced = plan.Count > 0
+            ? plan[^1].To
+            : (_coveredUntilUtc ?? nowUtc.AddMinutes(-cfg.LagMinutes));
+
+        _serverLedger = merged;
+        _coveredUntilUtc = advanced;
+        _providerState.CoveredUntilUtc = advanced;
+        _providerState.LastSuccessUtc = nowUtc;
+        _providerState.LastAttemptUtc = nowUtc;
+        _providerState.LastError = null;
+        _providerState.ServerTotalTokens = merged.TotalTokens();
+        SaveProviderState();
+
+        Log.Info($"服务端用量拉取完成：{windows} 段 / {pages} 页 / {Format.Bytes(bytes)}，"
+               + $"水位线推到 {advanced:yyyy-MM-dd HH:mm}Z，累计 {Format.Tokens(_providerState.ServerTotalTokens)} token");
+    }
+
+    private void RememberProviderFailure(string note)
+    {
+        _providerState.LastAttemptUtc = DateTime.UtcNow;
+        _providerState.LastError = note;
+        SaveProviderState();
+        Log.Warn(note + "（保留上一次服务端数据，并继续用本地日志兜底）");
+    }
+
+    private void OnProviderConfigChanged()
+    {
+        var cfg = ProviderConfig.Parse(Settings.Get("provider", string.Empty));
+        if (!cfg.Enabled)
+        {
+            // 关掉接口就不能再拿旧的服务端数据压制本地日志
+            _serverLedger = null;
+            _coveredUntilUtc = null;
+            _providerState.CoveredUntilUtc = null;
+            SaveProviderState();
+            Log.Info("服务端接口已关闭，回到纯本地日志模式");
+        }
+        _ = RefreshAsync("接口配置变更");
+    }
+
+    private string ProviderStatePath() => Path.Combine(_cacheDir, "provider-state-v1.json");
+
+    private ProviderState LoadProviderState()
+    {
+        try
+        {
+            if (File.Exists(ProviderStatePath()))
+                return ProviderState.Parse(File.ReadAllText(ProviderStatePath()));
+        }
+        catch (Exception ex) { Log.Warn($"读不到同步水位线（忽略）：{ex.Message}"); }
+        return new ProviderState();
+    }
+
+    private void SaveProviderState()
+    {
+        try
+        {
+            Directory.CreateDirectory(_cacheDir);
+            File.WriteAllText(ProviderStatePath(), _providerState.ToJson());
+        }
+        catch (Exception)
+        {
+            // 水位线写不下去只影响下次从哪里续拉，不影响本轮显示
+        }
+    }
 
     /// <summary>单价/目录变了但没重扫：直接用已有账本重算快照（很便宜，不必读盘）。</summary>
     private void RecomputeFromLedger(string reason)
@@ -280,28 +437,19 @@ public sealed class TokenMeterPlugin : IslandPluginBase
     private void OnPricingChanged() => RecomputeFromLedger("单价变更");
 
     /// <summary>
-    /// 诊断文本全部集中在设置页：岛面和聚光卡只留数据，不再挂提示行。
-    /// （本来卡片顶部/底部那两行诊断文字也搬到这里了）
+    /// 设置页顶部状态行。按用户要求只留「时间 + 口径」与出事才说的告警；
+    /// 数据源路径、会话文件数与新读字节、单价基数、接口概要、缓存命中率、未定价清单全部不再在这里显示。
     /// </summary>
     private string HintLine(Snapshot s)
     {
-        var pricing = PricingConfig.Parse(Settings.Get("pricing", string.Empty));
         var parts = new List<string>
         {
             $"更新于 {Format.Ago(s.GeneratedUtc)}（{Format.Clock(s.GeneratedUtc)}）",
-            $"数据源 {s.RootDescription}",
-            $"{s.Files} 个会话文件、{s.LedgerDays} 天记录，本轮新读 {Format.Bytes(s.ScannedBytes)}",
-            $"单价基数：每 {Format.Tokens(pricing.PerTokens)} token 一个价，货币 {pricing.Currency}",
+            $"当前口径：{s.SourceMode}",
         };
 
-        if (s.Today.UnpricedModels > 0)
-            parts.Add($"今日 {s.Today.UnpricedModels} 个模型未定价，费用可能偏低");
-        if (s.Today.C.Total > 0)
-            parts.Add($"今日缓存命中 {Format.Percent(s.Today.C.CacheHitRate)}");
-        if (s.UnpricedNames.Count > 0)
-            parts.Add($"这些模型还没配单价（费用被算作 0）：{string.Join("、", s.UnpricedNames)}");
-        else if (s.HasData)
-            parts.Add("全部模型都已配单价。");
+        // 这三条不是说明文字，而是「出事才会出现」的告警：接口降级/对账偏低、扫描提示、扫描出错
+        if (!string.IsNullOrEmpty(s.ProviderNote)) parts.Add(s.ProviderNote);
         if (!string.IsNullOrEmpty(s.Note)) parts.Add($"提示：{s.Note}");
         if (!string.IsNullOrEmpty(s.Error)) parts.Add($"出错：{s.Error}");
 
@@ -437,6 +585,99 @@ public sealed class TokenMeterPlugin : IslandPluginBase
         moneyRow.Children.Add(perBox);
         page.Children.Add(Card(moneyRow));
 
+        // ---- 服务端用量接口（优先于本地日志，失败自动降级）----
+        var prov = ProviderConfig.Parse(Settings.Get("provider", string.Empty));
+
+        page.Children.Add(new TextBlock
+        {
+            Text = "服务端用量接口（可选）",
+            FontSize = 13,
+            Margin = new Thickness(0, 8, 0, 0),
+        });
+        page.Children.Add(new TextBlock
+        {
+            Text = "启用后优先用服务端数据计费与跨设备汇总；接口不可用、超时或权限不足时自动降级回本地日志。"
+                 + "密钥不保存在插件里，只填环境变量名。下面这些默认值只是 OpenAI 风格的示例，"
+                 + "请按你账号实际能调通的接口改（字段名、分页、时间跨度限制都在高级 JSON 里）。",
+            FontSize = 12,
+            TextWrapping = TextWrapping.Wrap,
+            Opacity = 0.75,
+        });
+
+        var provToggle = new ToggleSwitch { Header = "启用服务端接口", IsOn = prov.Enabled };
+        provToggle.Toggled += (_, _) => SetProvider(c => c.Enabled = provToggle.IsOn);
+        page.Children.Add(Card(provToggle));
+
+        var baseUrlBox = MakeLine("接口根地址 BaseUrl", prov.BaseUrl, "https://api.example.com/v1", 460);
+        var pathBox = MakeLine("用量查询路径 Path", prov.Path, "/organization/usage/completions", 460);
+        CommitOnEnter(baseUrlBox, () => SetProvider(c => c.BaseUrl = (baseUrlBox.Text ?? string.Empty).Trim().TrimEnd('/')));
+        CommitOnEnter(pathBox, () => SetProvider(c =>
+        {
+            var p = (pathBox.Text ?? string.Empty).Trim();
+            if (p.Length > 0 && !p.StartsWith('/')) p = "/" + p;
+            c.Path = p;
+        }));
+        page.Children.Add(Card(baseUrlBox));
+        page.Children.Add(Card(pathBox));
+
+        var envBox = MakeLine("密钥所在环境变量名", prov.ApiKeyEnvVar, "TOKEN_METER_API_KEY", 300);
+        var provNameBox = MakeLine("显示名", prov.DisplayName, "自定义接口", 200);
+        CommitOnEnter(envBox, () => SetProvider(c => c.ApiKeyEnvVar = (envBox.Text ?? string.Empty).Trim()));
+        CommitOnEnter(provNameBox, () => SetProvider(c => c.DisplayName = (provNameBox.Text ?? string.Empty).Trim()));
+        var provRow1 = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 12 };
+        provRow1.Children.Add(provNameBox);
+        provRow1.Children.Add(envBox);
+        page.Children.Add(Card(provRow1));
+
+        var winBox = MakeLine("单段最大天数", prov.WindowMaxDays.ToString(CultureInfo.InvariantCulture), "30", 150);
+        var lagBox = MakeLine("滞后分钟", prov.LagMinutes.ToString(CultureInfo.InvariantCulture), "120", 150);
+        var backfillBox = MakeLine("首次往回追天数", prov.InitialBackfillDays.ToString(CultureInfo.InvariantCulture), "7", 150);
+        CommitOnEnter(winBox, () => SetProvider(c => { if (TryInt(winBox.Text, out var v)) c.WindowMaxDays = v; }));
+        CommitOnEnter(lagBox, () => SetProvider(c => { if (TryInt(lagBox.Text, out var v)) c.LagMinutes = v; }));
+        CommitOnEnter(backfillBox, () => SetProvider(c => { if (TryInt(backfillBox.Text, out var v)) c.InitialBackfillDays = v; }));
+        var provRow2 = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 12 };
+        provRow2.Children.Add(winBox);
+        provRow2.Children.Add(lagBox);
+        provRow2.Children.Add(backfillBox);
+        page.Children.Add(Card(provRow2));
+
+        // 高级：整份配置直接改。Parse 对坏 JSON 会静默回默认值，所以这里先严格校验再落盘。
+        var jsonBox = new TextBox
+        {
+            Header = "完整配置 JSON（字段映射、分页、口径都在这里改）",
+            Text = prov.ToJson(),
+            AcceptsReturn = true,
+            TextWrapping = TextWrapping.Wrap,
+            MinWidth = 640,
+            MinHeight = 96,
+            FontFamily = new FontFamily("Consolas, Cascadia Mono"),
+        };
+        var jsonStatus = new TextBlock { FontSize = 12, Opacity = 0.8, TextWrapping = TextWrapping.Wrap };
+
+        void CommitProviderJson()
+        {
+            var text = (jsonBox.Text ?? string.Empty).Trim();
+            if (text.Length == 0) return;
+            try
+            {
+                using var _ = JsonDocument.Parse(text);   // 先验语法，坏就拒绝保存
+            }
+            catch (Exception ex)
+            {
+                jsonStatus.Text = "JSON 格式不对，没有保存：" + ex.Message;
+                return;
+            }
+            var cfg = ProviderConfig.Parse(text);
+            var normalized = cfg.ToJson();
+            if (string.Equals(normalized, Settings.Get("provider", string.Empty), StringComparison.Ordinal)) return;
+            Settings.Set("provider", normalized);
+            jsonBox.Text = normalized;                     // 回填规范化后的内容，让用户看到默认值被补全了什么
+            jsonStatus.Text = "已保存并重新拉取。";
+        }
+        jsonBox.LostFocus += (_, _) => CommitProviderJson();
+        page.Children.Add(Card(jsonBox));
+        page.Children.Add(jsonStatus);
+
         // ---- 模型单价表 ----
         page.Children.Add(new TextBlock
         {
@@ -461,7 +702,7 @@ public sealed class TokenMeterPlugin : IslandPluginBase
         var nameBox = new TextBox
         {
             Header = "模型名",
-            PlaceholderText = "例如 SCNet-Max",
+            PlaceholderText = "例如 gpt-4o-mini / claude-sonnet",
             MinWidth = 220,
             HorizontalAlignment = HorizontalAlignment.Left,
         };
@@ -508,6 +749,7 @@ public sealed class TokenMeterPlugin : IslandPluginBase
             // 动作之前先提交本页其它还没保存的输入（按钮点击早于 LostFocus，§15.1）
             CommitCurrency(currencyBox);
             CommitPer(perBox);
+            CommitRoots(rootsBox);
 
             var name = (nameBox.Text ?? string.Empty).Trim();
             if (name.Length == 0)
@@ -551,6 +793,7 @@ public sealed class TokenMeterPlugin : IslandPluginBase
             CommitCurrency(currencyBox);
             CommitPer(perBox);
             CommitPriority(priorityBox);
+            CommitProviderJson();
             Status("正在刷新…");
             _ = RefreshAsync("手动刷新");
         };
@@ -719,6 +962,37 @@ public sealed class TokenMeterPlugin : IslandPluginBase
     };
 
     // ---- 三个提交点：失焦 + 回车 + 动作前（§15.1）----
+
+    /// <summary>改一个配置字段：只在真的变了时写回，避免每次失焦都触发一轮重拉。</summary>
+    private void SetProvider(Action<ProviderConfig> mutate)
+    {
+        var cfg = ProviderConfig.Parse(Settings.Get("provider", string.Empty));
+        var before = cfg.ToJson();
+        mutate(cfg);
+        var after = cfg.ToJson();
+        if (string.Equals(before, after, StringComparison.Ordinal)) return;
+        Settings.Set("provider", after);   // 触发 OnProviderConfigChanged
+    }
+
+    private static TextBox MakeLine(string header, string text, string placeholder, double minWidth)
+        => new()
+        {
+            Header = header,
+            Text = text,
+            PlaceholderText = placeholder,
+            MinWidth = minWidth,
+            HorizontalAlignment = HorizontalAlignment.Left,
+        };
+
+    private void CommitOnEnter(TextBox box, Action commit)
+        => box.KeyDown += (_, e) =>
+        {
+            if (e.Key == Windows.System.VirtualKey.Enter) commit();
+        };
+
+    private static bool TryInt(string? text, out int value)
+        => int.TryParse((text ?? string.Empty).Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out value)
+            && value > 0;
 
     private void CommitRoots(TextBox box)
     {

@@ -1,11 +1,11 @@
 {
   "id": "token-meter",
   "name": "Token 计岛",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "entry_dll": "TokenMeter.dll",
   "api_version": 2,
   "min_host_version": "2.4.0",
-  "description": "实时显示token用量与费用、今日花费与明细、能展开近7天趋势。只读本机会话日志，不联网。",
+  "description": "实时显示token用量与费用、今日花费与明细、能展开近7天趋势。默认只读本机会话日志；可选启用服务商用量接口（密钥走环境变量，接口挂了自动降级回本地日志）。",
   "author": "KujouShiori",
   "homepage": "https://github.com/KujouShiori/token-meter",
   "icon_glyph": "\uE8EF",

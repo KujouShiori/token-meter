@@ -1,0 +1,431 @@
+using System.Globalization;
+using System.Net;
+using System.Net.Http;
+using System.Text;
+using System.Text.Json;
+
+namespace TokenMeter;
+
+/// <summary>接口侧的可预期失败：调用方据此降级到本地日志，不当成崩溃。</summary>
+public sealed class ProviderException : Exception
+{
+    /// <summary>true = 权限/配置类问题，重试无意义，本轮直接降级并停手。</summary>
+    public bool Permanent { get; }
+
+    public ProviderException(string message, bool permanent = false) : base(message)
+    {
+        Permanent = permanent;
+    }
+}
+
+public sealed class ProviderFetchResult
+{
+    public UsageLedger Ledger { get; } = new();
+    /// <summary>服务端数据可信到哪一刻（已扣掉滞后带）。</summary>
+    public DateTime CoveredUntilUtc { get; set; }
+    public int Windows { get; set; }
+    public int Pages { get; set; }
+    public long BytesIn { get; set; }
+    public bool HadRequestsField { get; set; }
+}
+
+/// <summary>
+/// 通用「OpenAI 风格」用量接口客户端。
+///
+/// 三件事按用户要求处理：
+///   1. 分页：PageTokenField 非空就一直翻，受 MaxPagesPerWindow 上限保护；
+///   2. 时间窗口：从水位线滚到「现在 - 滞后带」，跨度超过 WindowMaxDays 就切段，
+///      一轮最多 MaxWindowsPerRun 段，避免首次同步把界面卡死；
+///   3. 字段口径：InputIncludesCached 决定缓存部分是从输入里减出来还是直接相加。
+///
+/// 所有字段名与限制都来自 ProviderConfig，代码里不写死任何厂商数值。
+/// </summary>
+public sealed class ProviderClient : IDisposable
+{
+    private readonly HttpClient _http;
+
+    public ProviderClient(int timeoutSeconds)
+    {
+        _http = new HttpClient
+        {
+            Timeout = TimeSpan.FromSeconds(Math.Clamp(timeoutSeconds, 2, 120)),
+        };
+    }
+
+    /// <summary>
+    /// 拉取 (from, to] 区间的服务端数据。调用方负责把 to 限制在「现在 - 滞后带」内。
+    /// </summary>
+    public async Task<ProviderFetchResult> FetchAsync(
+        ProviderConfig cfg, DateTime fromUtc, DateTime toUtc, CancellationToken ct)
+    {
+        if (!cfg.IsUsable(out var why)) throw new ProviderException(why, permanent: true);
+
+        var key = Environment.GetEnvironmentVariable(cfg.ApiKeyEnvVar.Trim()) ?? string.Empty;
+        if (string.IsNullOrWhiteSpace(key))
+            throw new ProviderException($"环境变量 {cfg.ApiKeyEnvVar.Trim()} 没有值", permanent: true);
+
+        var result = new ProviderFetchResult { CoveredUntilUtc = toUtc };
+        var cursor = string.Empty;
+        var pages = 0;
+
+        while (true)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            var url = BuildUrl(cfg, fromUtc, toUtc, cursor);
+            using var req = new HttpRequestMessage(HttpMethod.Get, url);
+
+            // 只加一个鉴权头；头名和前缀都可配，不假设任何厂商写法
+            var headerValue = string.IsNullOrEmpty(cfg.AuthPrefix) ? key : cfg.AuthPrefix + key;
+            if (!TryAddHeader(req, cfg.AuthHeader, headerValue, out var headerError))
+                throw new ProviderException(headerError, permanent: true);
+
+            // 部分接口除了鉴权头还强制要求版本头（例如 anthropic-version）
+            foreach (var (hk, hv) in ParseExtraHeaders(cfg.ExtraHeaders))
+                req.Headers.TryAddWithoutValidation(hk, hv);
+
+            HttpResponseMessage resp;
+            try
+            {
+                resp = await _http.SendAsync(req, HttpCompletionOption.ResponseContentRead, ct).ConfigureAwait(false);
+            }
+            catch (TaskCanceledException) when (!ct.IsCancellationRequested)
+            {
+                throw new ProviderException($"请求超时（{cfg.TimeoutSeconds}s）");
+            }
+            catch (HttpRequestException ex)
+            {
+                throw new ProviderException($"连不上接口：{ex.Message}");
+            }
+
+            using (resp)
+            {
+                if (resp.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
+                    throw new ProviderException($"权限不足或密钥无效（HTTP {(int)resp.StatusCode}）——"
+                        + "注意：受限 Key 常常只能看到自己创建的 Key 的用量，这类接口不会报错，只会少给数",
+                        permanent: true);
+
+                if (resp.StatusCode == HttpStatusCode.NotFound)
+                    throw new ProviderException($"接口路径不存在（HTTP 404）：{cfg.Path}", permanent: true);
+
+                if (!resp.IsSuccessStatusCode)
+                {
+                    var body = await SafeReadBodyAsync(resp, ct).ConfigureAwait(false);
+                    throw new ProviderException($"HTTP {(int)resp.StatusCode}{(string.IsNullOrEmpty(body) ? "" : "：" + body)}");
+                }
+
+                var json = await resp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+                result.BytesIn += Encoding.UTF8.GetByteCount(json);
+
+                JsonDocument doc;
+                try
+                {
+                    doc = JsonDocument.Parse(json);
+                }
+                catch (JsonException ex)
+                {
+                    throw new ProviderException($"返回不是合法 JSON：{ex.Message}", permanent: true);
+                }
+
+                using (doc)
+                {
+                    var root = doc.RootElement;
+
+                    var (resolved, pairs) = EnumerateItems(root, cfg.ItemsPath);
+                    if (!resolved)
+                        throw new ProviderException($"在返回里找不到条目数组「{cfg.ItemsPath}」——请改 ItemsPath", permanent: true);
+
+                    foreach (var (owner, item) in pairs)
+                    {
+                        if (item.ValueKind != JsonValueKind.Object) continue;
+                        AbsorbItem(cfg, owner, item, result);
+                    }
+
+                    // 分页：游标字段为空即结束；has_more 存在且为 false 也结束
+                    cursor = string.Empty;
+                    if (!string.IsNullOrWhiteSpace(cfg.PageTokenField)
+                        && TryNavigate(root, cfg.PageTokenField, out var tokenEl))
+                    {
+                        cursor = tokenEl.ValueKind switch
+                        {
+                            JsonValueKind.String => tokenEl.GetString() ?? string.Empty,
+                            JsonValueKind.Number => tokenEl.ToString(),
+                            _ => string.Empty,
+                        };
+                    }
+
+                    if (!string.IsNullOrWhiteSpace(cfg.HasMoreField)
+                        && TryNavigate(root, cfg.HasMoreField, out var hasMore))
+                    {
+                        if (hasMore.ValueKind == JsonValueKind.False) cursor = string.Empty;
+                    }
+
+                    result.Pages = ++pages;
+                    if (string.IsNullOrEmpty(cursor)) break;
+                    if (pages >= cfg.MaxPagesPerWindow)
+                        throw new ProviderException($"分页超过上限 {cfg.MaxPagesPerWindow} 页仍未结束——请检查 PageTokenField/PageParam 是否配对");
+                }
+            }
+        }
+
+        return result;
+    }
+
+    private static bool TryAddHeader(HttpRequestMessage req, string name, string value, out string error)
+    {
+        error = string.Empty;
+        if (string.IsNullOrWhiteSpace(name)) { error = "鉴权头名字没填"; return false; }
+        try
+        {
+            // HttpClient 对 Authorization 有专门处理，走通用 TryAddWithoutValidation 最省事也最不容易踩格式校验
+            req.Headers.TryAddWithoutValidation(name.Trim(), value);
+            return req.Headers.Contains(name.Trim());
+        }
+        catch (Exception ex)
+        {
+            error = $"鉴权头「{name}」加不上：{ex.Message}";
+            return false;
+        }
+    }
+
+    private static async Task<string> SafeReadBodyAsync(HttpResponseMessage resp, CancellationToken ct)
+    {
+        try
+        {
+            var body = await resp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+            body = body.Replace('\r', ' ').Replace('\n', ' ').Trim();
+            return body.Length > 200 ? body[..200] + "…" : body;
+        }
+        catch (Exception)
+        {
+            return string.Empty;
+        }
+    }
+
+    /// <summary>解析额外固定请求头：多个用分号或换行分隔，每项 k=v。</summary>
+    internal static List<(string Name, string Value)> ParseExtraHeaders(string raw)
+    {
+        var list = new List<(string, string)>();
+        if (string.IsNullOrWhiteSpace(raw)) return list;
+        foreach (var pair in raw.Split(new[] { ';', '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries))
+        {
+            var kv = pair.Split('=', 2);
+            if (kv.Length != 2) continue;
+            var name = kv[0].Trim();
+            if (name.Length == 0) continue;
+            list.Add((name, kv[1].Trim()));
+        }
+        return list;
+    }
+
+    /// <summary>
+    /// 按 ItemsPath 展开条目，支持 data（扁平）与 data[].results（两层）。
+    /// 每项连同「拥有它的上层对象」一起返回，因为时间戳可能写在外层时间桶上。
+    /// found=false 表示路径没解析到数组；路径对但数组为空时 found=true 且列表为空（那是真的没用量）。
+    /// </summary>
+    internal static (bool Found, List<(JsonElement Owner, JsonElement Item)> Items) EnumerateItems(JsonElement root, string itemsPath)
+    {
+        var empty = new List<(JsonElement, JsonElement)>();
+        var segs = (itemsPath ?? string.Empty).Split('.', StringSplitOptions.RemoveEmptyEntries);
+        if (segs.Length == 0) return (false, empty);
+
+        var current = new List<(JsonElement Owner, JsonElement El)> { (default, root) };
+        var lastWasArray = false;
+
+        for (var i = 0; i < segs.Length; i++)
+        {
+            lastWasArray = false;
+            var seg = segs[i];
+            if (seg.EndsWith("[]", StringComparison.Ordinal)) seg = seg[..^2];
+
+            var next = new List<(JsonElement, JsonElement)>();
+            foreach (var (_, el) in current)
+            {
+                if (el.ValueKind != JsonValueKind.Object) continue;
+                if (!el.TryGetProperty(seg, out var child)) continue;
+                if (child.ValueKind == JsonValueKind.Array)
+                {
+                    lastWasArray = true;
+                    foreach (var g in child.EnumerateArray()) next.Add((el, g));
+                }
+                else
+                {
+                    next.Add((el, child));
+                }
+            }
+            current = next;
+            if (current.Count == 0 && i < segs.Length - 1) return (false, empty);
+        }
+
+        if (!lastWasArray) return (false, empty);
+        return (true, current);
+    }
+
+    private static void AbsorbItem(ProviderConfig cfg, JsonElement owner, JsonElement item, ProviderFetchResult result)
+    {
+        // 时间：先在条目里找，找不到再到上层时间桶上找；取不到就整条跳过——归错日期比漏一条更糟
+        if (string.IsNullOrWhiteSpace(cfg.TimeField)) return;
+        var gotTime = TryNavigate(item, cfg.TimeField, out var timeEl);
+        if (!gotTime && owner.ValueKind == JsonValueKind.Object)
+            gotTime = TryNavigate(owner, cfg.TimeField, out timeEl);
+        if (!gotTime) return;
+
+        DateTime utc;
+        if (timeEl.ValueKind == JsonValueKind.String)
+        {
+            var s = timeEl.GetString() ?? string.Empty;
+            if (!DateTime.TryParse(s, CultureInfo.InvariantCulture,
+                    DateTimeStyles.AdjustToUniversal | DateTimeStyles.AssumeUniversal, out utc))
+                return;
+        }
+        else if (timeEl.ValueKind == JsonValueKind.Number)
+        {
+            // 秒或毫秒都见过，按量级判一下
+            var v = timeEl.GetDouble();
+            utc = v > 1e11
+                ? DateTimeOffset.FromUnixTimeMilliseconds((long)v).UtcDateTime
+                : DateTimeOffset.FromUnixTimeSeconds((long)v).UtcDateTime;
+        }
+        else
+        {
+            return;
+        }
+
+        var dayKey = Format.DayKey(DateOnly.FromDateTime(TimeZoneInfo.ConvertTimeFromUtc(utc, TimeZoneInfo.Local)));
+
+        var model = string.IsNullOrEmpty(cfg.ModelField) ? cfg.ModelFallback : null;
+        if (model is null && TryNavigate(item, cfg.ModelField, out var modelEl))
+            model = modelEl.ValueKind == JsonValueKind.String ? modelEl.GetString() : modelEl.ToString();
+        if (string.IsNullOrWhiteSpace(model)) model = cfg.ModelFallback;
+
+        var rawIn = ReadNumber(item, cfg.InputField);
+        var outp = ReadNumber(item, cfg.OutputField);
+        var cached = ReadNumber(item, cfg.CachedInputField);
+        var cacheWrite = ReadNumber(item, cfg.CacheWriteField);
+        var requests = ReadNumber(item, cfg.RequestsField);
+        if (requests > 0) result.HadRequestsField = true;
+
+        long uncached;
+        if (cfg.InputIncludesCached)
+        {
+            // 输入里已含缓存 → 减出来。减成负数说明口径判断反了，夹到 0 并让上层有机会发现。
+            uncached = Math.Max(0, rawIn - cached);
+        }
+        else
+        {
+            uncached = rawIn;
+        }
+
+        var c = new Counters
+        {
+            Input = uncached,
+            Output = outp,
+            CacheRead = cached,
+            CacheWrite = cacheWrite,
+            Requests = requests,
+        };
+        c.Total = c.Input + c.Output + c.CacheRead + c.CacheWrite;
+        if (c.Total <= 0) return;
+
+        result.Ledger.Add(dayKey, model!, c);
+        if (utc > result.CoveredUntilUtc) result.CoveredUntilUtc = utc;
+    }
+
+    /// <summary>读数值字段。支持逗号分隔的多个路径并求和（例如缓存写分 5 分钟与 1 小时两档）。</summary>
+    private static long ReadNumber(JsonElement item, string paths)
+    {
+        if (string.IsNullOrWhiteSpace(paths)) return 0;
+        long sum = 0;
+        foreach (var path in paths.Split(',', StringSplitOptions.RemoveEmptyEntries))
+        {
+            if (!TryNavigate(item, path.Trim(), out var el)) continue;
+            sum += el.ValueKind switch
+            {
+                JsonValueKind.Number => el.TryGetInt64(out var l) ? l : (long)Math.Round(el.GetDouble()),
+                JsonValueKind.String => long.TryParse(el.GetString(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var p)
+                    ? p : 0,
+                _ => 0,
+            };
+        }
+        return sum;
+    }
+
+    /// <summary>支持 "a.b.c" 形式的点号路径；数组下标暂不支持（各家结构差异太大，交给配置改路径）。</summary>
+    internal static bool TryNavigate(JsonElement root, string path, out JsonElement found)
+    {
+        found = root;
+        if (string.IsNullOrWhiteSpace(path)) return false;
+        foreach (var seg in path.Split('.', StringSplitOptions.RemoveEmptyEntries))
+        {
+            if (found.ValueKind != JsonValueKind.Object) return false;
+            if (!found.TryGetProperty(seg, out found)) return false;
+        }
+        return true;
+    }
+
+    /// <summary>
+    /// 规划本轮要拉的时间窗口：从水位线滚到「现在 - 滞后带」，跨度超过 WindowMaxDays 就切段，
+    /// 最多 MaxWindowsPerRun 段（防止首次同步把界面卡死）。抽成纯函数是为了能单独测。
+    /// </summary>
+    public static List<(DateTime From, DateTime To)> PlanWindows(DateTime? watermarkUtc, DateTime nowUtc, ProviderConfig cfg)
+    {
+        var trustUntil = nowUtc.AddMinutes(-cfg.LagMinutes);
+        var from = watermarkUtc ?? trustUntil.AddDays(-cfg.InitialBackfillDays);
+        if (from > trustUntil) from = trustUntil;
+
+        var plan = new List<(DateTime, DateTime)>();
+        while (from < trustUntil && plan.Count < cfg.MaxWindowsPerRun)
+        {
+            var to = from.AddDays(cfg.WindowMaxDays);
+            if (to > trustUntil) to = trustUntil;
+            plan.Add((from, to));
+            from = to;
+        }
+        return plan;
+    }
+
+    private static string BuildUrl(ProviderConfig cfg, DateTime fromUtc, DateTime toUtc, string cursor)
+    {
+        var q = new StringBuilder();
+        Append(q, cfg.StartParam, FormatTime(cfg, fromUtc));
+        Append(q, cfg.EndParam, FormatTime(cfg, toUtc));
+        if (!string.IsNullOrWhiteSpace(cfg.ExtraQuery))
+        {
+            foreach (var pair in cfg.ExtraQuery.Split('&', StringSplitOptions.RemoveEmptyEntries))
+            {
+                var kv = pair.Split('=', 2);
+                if (kv.Length == 2) AppendRaw(q, kv[0].Trim(), kv[1].Trim());
+            }
+        }
+        if (!string.IsNullOrEmpty(cursor) && !string.IsNullOrWhiteSpace(cfg.PageParam))
+            Append(q, cfg.PageParam, cursor);
+        if (!string.IsNullOrWhiteSpace(cfg.LimitParam) && cfg.LimitPerRequest > 0)
+            AppendRaw(q, cfg.LimitParam.Trim(), cfg.LimitPerRequest.ToString(CultureInfo.InvariantCulture));
+
+        return cfg.BaseUrl.TrimEnd('/') + cfg.Path + (q.Length > 0 ? "?" + q : string.Empty);
+    }
+
+    private static string FormatTime(ProviderConfig cfg, DateTime utc)
+    {
+        var kind = (cfg.TimeFormat ?? string.Empty).Trim().ToLowerInvariant();
+        if (kind == "unix")
+            return new DateTimeOffset(DateTime.SpecifyKind(utc, DateTimeKind.Utc)).ToUnixTimeSeconds().ToString(CultureInfo.InvariantCulture);
+        if (kind == "rfc3339")
+            return DateTime.SpecifyKind(utc, DateTimeKind.Utc).ToString("yyyy-MM-ddTHH:mm:ssZ", CultureInfo.InvariantCulture);
+        return utc.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+    }
+
+    private static void Append(StringBuilder q, string name, string value)
+    {
+        if (string.IsNullOrWhiteSpace(name)) return;
+        AppendRaw(q, name, Uri.EscapeDataString(value));
+    }
+
+    private static void AppendRaw(StringBuilder q, string name, string encodedValue)
+    {
+        if (q.Length > 0) q.Append('&');
+        q.Append(name).Append('=').Append(encodedValue);
+    }
+
+    public void Dispose() => _http.Dispose();
+}
