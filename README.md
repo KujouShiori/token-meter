@@ -19,7 +19,11 @@ WinIsland / WinLand 灵动岛插件：实时显示本机 AI 会话的 **token �
 ### 网络与密钥
 
 - 只向你配置的那一个地址发 GET 请求；除了这个接口不发任何其他网络请求。
+- **发请求前会卡一次地址**（AssertSafeUrl）：必须是 http/https 绝对地址；带密钥时禁止走明文 http（本地调试用 127.0.0.1 / localhost 例外）。BaseUrl 填错等于把密钥送给别人，这里宁可不发。
 - **密钥不保存在插件里**：设置页只存一个**环境变量名**，运行时从环境变量读。因此密钥不会落进宿主的 settings.json、不会进插件自己的缓存文件、也不会出现在错误文案里。
+- 少数接口把密钥放在查询参数里（如 ?key=*** 形态），路径里写 {key} 即可，会做 URL 转义；{base} 可引用 BaseUrl。
+- **识别「HTTP 200 但业务层报错」**：部分接口 key 不对也返回 200，真正的错误在 body 的 code/msg 或 error.message 里。不抱出来就会被当成「空数据」静默吞掉，所以插件会检查 success=false / ok=false / code 非 0 且带 msg / error 字段，并把原因报进日志。
+- 取值路径支持数组下标（如 balance_infos[0].total_balance）；ValueScale 用于接口返回单位不是「个」的情况（如返回「分」时填 0.01）。
 - 接口失败只在插件日志里留一句原因（含 HTTP 状态码），不重试轰炸；下一轮刷新再试。
 
 ### 字段口径（最容易算错的地方）
@@ -81,7 +85,9 @@ WinIsland / WinLand 灵动岛插件：实时显示本机 AI 会话的 **token �
 
 ## 已核实的接口预设
 
-下面这份是 **Anthropic Usage & Cost Admin API** 的可用配置，字段与限制已对官方文档核实。直接贴到设置页的「完整配置 JSON」里即可：
+设置页有「**套用接口预设**」下拉 + 一个套用按钮，把「接一家要改哪十来个字段」变成一次选择。套用后仍需你自己填 BaseUrl（通用模板预设为空）并把密钥设进对应环境变量；**预设不会替你打开联网开关**，也不会保存密钥。
+
+下面这份 Anthropic 配置的字段与限制已对官方文档核实，直接贴到设置页的「完整配置 JSON」里也可以：
 
 ```json
 {
@@ -138,6 +144,12 @@ WinIsland / WinLand 灵动岛插件：实时显示本机 AI 会话的 **token �
 两个已知缺口：group_by[]=model 才能按模型拆分；**服务端不给请求次数**（RequestsField 留空），所以混合口径下「请求数」仍只来自本地日志。另：Priority Tier 的费用不在 cost 端点里，得用 usage 端点。
 
 > 代码默认的 input_tokens / input_cached_tokens / after / Authorization: Bearer 只是示例写法，**不要当成 OpenAI 的事实**；要接 OpenAI 请先自己核对其字段名与限制再改预设。
+
+## 致谢与代码来源
+
+接口层的三个实现思路——**声明式厂商模板 + JSON 路径取值（含数组下标）+ scale 乘数**、**从 2xx 响应体里提炼业务层错误**、**发请求前的地址安全卡控**——参考自 [MeteorNOX/DeepSeek-Balance-Whale-Widget](https://github.com/MeteorNOX/DeepSeek-Balance-Whale-Widget)（其 lib/ 部分为 MIT 许可，作者已同意复用这三个实现方法）。
+
+本仓库只按这些思路用 C# 重新实现，**没有复制它的任何文件**，也没有使用其 assets/ 与 icon.png（按其 PROVENANCE.md，那部分不在 MIT 覆盖范围内）。
 
 ## 已知边界
 

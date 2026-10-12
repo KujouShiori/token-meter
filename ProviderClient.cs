@@ -72,7 +72,13 @@ public sealed class ProviderClient : IDisposable
         {
             ct.ThrowIfCancellationRequested();
 
-            var url = BuildUrl(cfg, fromUtc, toUtc, cursor);
+            var url = BuildUrl(cfg, fromUtc, toUtc, cursor)
+                .Replace("{base}", cfg.BaseUrl, StringComparison.Ordinal);
+            // 少数接口把密钥放在查询参数里（例如 Gemini 的 ?key=…），这里才做 {key} 替换；
+            // 替换完再跑安全校验，保证真正要发出去的那个地址是安全文的
+            url = url.Replace("{key}", Uri.EscapeDataString(key), StringComparison.Ordinal);
+            AssertSafeUrl(url);
+
             using var req = new HttpRequestMessage(HttpMethod.Get, url);
 
             // 只加一个鉴权头；头名和前缀都可配，不假设任何厂商写法
@@ -130,6 +136,12 @@ public sealed class ProviderClient : IDisposable
                 using (doc)
                 {
                     var root = doc.RootElement;
+
+                    // 有些接口 key 不对也返回 HTTP 200，真正的问题在 body 的 code/msg：
+                    // 不抱出来就会被当成「空数据」静默呌掉（这个思路抄自 DeepSeek-Balance-Whale-Widget）
+                    var bizError = ApiBusinessError(root);
+                    if (!string.IsNullOrEmpty(bizError))
+                        throw new ProviderException($"接口返回 200 但业务层报错：{bizError}");
 
                     var (resolved, pairs) = EnumerateItems(root, cfg.ItemsPath);
                     if (!resolved)
@@ -298,11 +310,11 @@ public sealed class ProviderClient : IDisposable
             model = modelEl.ValueKind == JsonValueKind.String ? modelEl.GetString() : modelEl.ToString();
         if (string.IsNullOrWhiteSpace(model)) model = cfg.ModelFallback;
 
-        var rawIn = ReadNumber(item, cfg.InputField);
-        var outp = ReadNumber(item, cfg.OutputField);
-        var cached = ReadNumber(item, cfg.CachedInputField);
-        var cacheWrite = ReadNumber(item, cfg.CacheWriteField);
-        var requests = ReadNumber(item, cfg.RequestsField);
+        var rawIn = ReadNumber(item, cfg.InputField, cfg.ValueScale);
+        var outp = ReadNumber(item, cfg.OutputField, cfg.ValueScale);
+        var cached = ReadNumber(item, cfg.CachedInputField, cfg.ValueScale);
+        var cacheWrite = ReadNumber(item, cfg.CacheWriteField, cfg.ValueScale);
+        var requests = ReadNumber(item, cfg.RequestsField, 1);   // 请求数是计数，不跟着 token 缩放
         if (requests > 0) result.HadRequestsField = true;
 
         long uncached;
@@ -331,35 +343,153 @@ public sealed class ProviderClient : IDisposable
         if (utc > result.CoveredUntilUtc) result.CoveredUntilUtc = utc;
     }
 
-    /// <summary>读数值字段。支持逗号分隔的多个路径并求和（例如缓存写分 5 分钟与 1 小时两档）。</summary>
-    private static long ReadNumber(JsonElement item, string paths)
+    /// <summary>读数值字段。支持逗号分隔的多个路径并求和（例如缓存写分 5m 与 1h 两档）。</summary>
+    private static long ReadNumber(JsonElement item, string paths, double scale)
     {
         if (string.IsNullOrWhiteSpace(paths)) return 0;
-        long sum = 0;
+        double sum = 0;
         foreach (var path in paths.Split(',', StringSplitOptions.RemoveEmptyEntries))
         {
             if (!TryNavigate(item, path.Trim(), out var el)) continue;
             sum += el.ValueKind switch
             {
-                JsonValueKind.Number => el.TryGetInt64(out var l) ? l : (long)Math.Round(el.GetDouble()),
-                JsonValueKind.String => long.TryParse(el.GetString(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var p)
+                JsonValueKind.Number => el.TryGetInt64(out var l) ? l : el.GetDouble(),
+                JsonValueKind.String => double.TryParse(el.GetString(), NumberStyles.Float, CultureInfo.InvariantCulture, out var p)
                     ? p : 0,
                 _ => 0,
             };
         }
-        return sum;
+        if (sum == 0) return 0;
+        var s = scale > 0 && !double.IsNaN(scale) && !double.IsInfinity(scale) ? scale : 1.0;
+        return (long)Math.Round(sum * s, MidpointRounding.AwayFromZero);
     }
 
-    /// <summary>支持 "a.b.c" 形式的点号路径；数组下标暂不支持（各家结构差异太大，交给配置改路径）。</summary>
+    /// <summary>
+    /// 发请求前的地址卡控：必须是 http/https 绝对地址，且带密钥时禁止走明文。
+    /// 这一条是真实风险：BaseUrl 填错就等于把环境变量里的密钥发给别人。
+    /// </summary>
+    internal static void AssertSafeUrl(string url)
+    {
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var u))
+            throw new ProviderException($"接口地址不是合法 URL：{url}", permanent: true);
+        var https = string.Equals(u.Scheme, "https", StringComparison.OrdinalIgnoreCase);
+        var http = string.Equals(u.Scheme, "http", StringComparison.OrdinalIgnoreCase);
+        if (!https && !http)
+            throw new ProviderException($"只允许 http/https，当前是「{u.Scheme}」", permanent: true);
+        if (!https && !IsLoopback(u))
+            throw new ProviderException("BaseUrl 是明文 http，会把密钥连带送出；请改用 https（本地调试可用 127.0.0.1）", permanent: true);
+    }
+
+    private static bool IsLoopback(Uri u)
+        => u.IsLoopback
+           || string.Equals(u.Host, "localhost", StringComparison.OrdinalIgnoreCase)
+           || u.Host.StartsWith("127.", StringComparison.Ordinal);
+
+    /// <summary>
+    /// 从 2xx 响应体里提炼业务层错误：success/ok 为 false、code 非 0/200 且带 msg、
+    /// 或 error 字段。返回空串表示没发现问题。
+    /// </summary>
+    internal static string ApiBusinessError(JsonElement root)
+    {
+        if (root.ValueKind != JsonValueKind.Object) return string.Empty;
+
+        if (root.TryGetProperty("success", out var s) && s.ValueKind == JsonValueKind.False)
+            return FirstMessage(root) ?? "success=false";
+        if (root.TryGetProperty("ok", out var ok) && ok.ValueKind == JsonValueKind.False)
+            return FirstMessage(root) ?? "ok=false";
+
+        if (root.TryGetProperty("code", out var code) && code.ValueKind == JsonValueKind.Number)
+        {
+            var c = code.GetDecimal();
+            if (c != 0m && c != 200m)
+            {
+                var msg = FirstMessage(root);
+                if (msg is not null) return $"code={c}：{msg}";
+            }
+        }
+
+        if (root.TryGetProperty("error", out var err))
+        {
+            if (err.ValueKind == JsonValueKind.String && err.GetString() is { Length: > 0 } es)
+                return Trunc(es);
+            if (err.ValueKind == JsonValueKind.Object
+                && err.TryGetProperty("message", out var em)
+                && em.ValueKind == JsonValueKind.String
+                && em.GetString() is { Length: > 0 } ees)
+                return Trunc(ees);
+        }
+
+        return string.Empty;
+    }
+
+    private static string? FirstMessage(JsonElement root)
+    {
+        foreach (var name in new[] { "msg", "message", "error_msg", "errMsg" })
+        {
+            if (root.TryGetProperty(name, out var el) && el.ValueKind == JsonValueKind.String
+                && el.GetString() is { Length: > 0 } s) return Trunc(s);
+        }
+        if (root.TryGetProperty("error", out var e) && e.ValueKind == JsonValueKind.Object
+            && e.TryGetProperty("message", out var em) && em.ValueKind == JsonValueKind.String)
+            return Trunc(em.GetString() ?? string.Empty);
+        return null;
+    }
+
+    private static string Trunc(string s)
+    {
+        var flat = s.Replace('\r', ' ').Replace('\n', ' ').Trim();
+        return flat.Length > 160 ? flat[..160] + "…" : flat;
+    }
+
+    /// <summary>
+    /// 按路径取值，支持点号与数组下标：{@code a.b[0].c}。
+    /// 下标支持是必要的：DeepSeek 余额就在 balance_infos[0].total_balance 这种位置。
+    /// </summary>
     internal static bool TryNavigate(JsonElement root, string path, out JsonElement found)
     {
         found = root;
         if (string.IsNullOrWhiteSpace(path)) return false;
-        foreach (var seg in path.Split('.', StringSplitOptions.RemoveEmptyEntries))
+
+        var cur = root;
+        var i = 0;
+        while (i < path.Length)
         {
-            if (found.ValueKind != JsonValueKind.Object) return false;
-            if (!found.TryGetProperty(seg, out found)) return false;
+            var start = i;
+            while (i < path.Length && path[i] != '.' && path[i] != '[') i++;
+            if (i > start)
+            {
+                if (cur.ValueKind != JsonValueKind.Object) return false;
+                if (!cur.TryGetProperty(path.Substring(start, i - start), out cur)) return false;
+            }
+
+            while (i < path.Length && path[i] == '[')
+            {
+                var close = path.IndexOf(']', i);
+                if (close < 0) return false;
+                if (!int.TryParse(path.AsSpan(i + 1, close - i - 1), NumberStyles.Integer, CultureInfo.InvariantCulture, out var idx))
+                    return false;
+                if (cur.ValueKind != JsonValueKind.Array) return false;
+
+                var pos = -1;
+                JsonElement? hit = null;
+                foreach (var el in cur.EnumerateArray())
+                {
+                    pos++;
+                    if (pos != idx) continue;
+                    hit = el;
+                    break;
+                }
+                if (hit is null || idx < 0) return false;
+                cur = hit.Value;
+                i = close + 1;
+            }
+
+            if (i < path.Length && path[i] == '.') { i++; continue; }
+            if (i >= path.Length) break;
+            if (path[i] != '[') return false;
         }
+
+        found = cur;
         return true;
     }
 
@@ -402,7 +532,9 @@ public sealed class ProviderClient : IDisposable
         if (!string.IsNullOrWhiteSpace(cfg.LimitParam) && cfg.LimitPerRequest > 0)
             AppendRaw(q, cfg.LimitParam.Trim(), cfg.LimitPerRequest.ToString(CultureInfo.InvariantCulture));
 
-        return cfg.BaseUrl.TrimEnd('/') + cfg.Path + (q.Length > 0 ? "?" + q : string.Empty);
+        // Path 里已经自带 ?（如 Gemini 的 /x?key=*** 形态）时用 & 接，否则会拼出两个问号
+        var joiner = (cfg.Path ?? string.Empty).Contains('?') ? "&" : "?";
+        return cfg.BaseUrl.TrimEnd('/') + cfg.Path + (q.Length > 0 ? joiner + q : string.Empty);
     }
 
     private static string FormatTime(ProviderConfig cfg, DateTime utc)

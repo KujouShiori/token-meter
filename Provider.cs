@@ -101,7 +101,15 @@ public sealed class ProviderConfig
     public bool InputIncludesCached { get; set; } = true;
 
     /// <summary>服务端返回里是否直接带金额字段；带就优先用它，省掉单价推算。</summary>
+    /// <summary>服务端返回里直接带金额的字段。当前版本**尚未接入计费**（费用仍按本地单价算），
+    /// 留作扩展；填了也不会生效，避免接口金额与本地单价两套口径打架。</summary>
     public string CostField { get; set; } = "";
+
+    /// <summary>所有 token 数值的统一乘数。接口返回的不是「个」而是「千/百万」时用它校正，默认 1。</summary>
+    public double ValueScale { get; set; } = 1;
+
+    /// <summary>金额字段的乘数（例如接口返回「分」时填 0.01）。默认 1。</summary>
+    public double CostScale { get; set; } = 1;
 
     // ---- 拉取节奏 ----
     /// <summary>单次请求的最大时间跨度。接口对跨度有限制时调小它，分段滚动拉。</summary>
@@ -179,6 +187,88 @@ public sealed class ProviderConfig
     public string SafeSummary()
         => $"{DisplayName}｜{BaseUrl}{Path}｜密钥来自环境变量 {ApiKeyEnvVar}｜窗口≤{WindowMaxDays}天｜滞后{LagMinutes}分钟｜"
          + $"输入{(InputIncludesCached ? "含" : "不含")}缓存";
+}
+
+/// <summary>一个可套用的接口预设。Basis 说清“这组值哪来的”：没核实的就写未核实，不假装成官方事实。</summary>
+public sealed class ProviderPreset
+{
+    public string Name { get; }
+    public string Basis { get; }
+    private readonly Func<ProviderConfig> _build;
+
+    public ProviderPreset(string name, string basis, Func<ProviderConfig> build)
+    {
+        Name = name;
+        Basis = basis;
+        _build = build;
+    }
+
+    /// <summary>生成一份配置；Enabled 由调用方按用户当前开关覆盖，预设不自作主张联网。</summary>
+    public ProviderConfig Build() => _build();
+}
+
+public static class ProviderPresets
+{
+    public static readonly ProviderPreset[] All =
+    {
+        new("Anthropic 用量接口", "已对官方文档核实（platform.claude.com）", () => new ProviderConfig
+        {
+            DisplayName = "Anthropic 组织用量",
+            BaseUrl = "https://api.anthropic.com",
+            Path = "/v1/organizations/usage_report/messages",
+            AuthHeader = "x-api-key",
+            AuthPrefix = "",
+            ApiKeyEnvVar = "ANTHROPIC_ADMIN_KEY",
+            ExtraHeaders = "anthropic-version=2023-06-01",
+            StartParam = "starting_at",
+            EndParam = "ending_at",
+            TimeFormat = "rfc3339",
+            ExtraQuery = "bucket_width=1d&group_by[]=model",
+            ItemsPath = "data[].results",
+            TimeField = "starting_at",
+            ModelField = "model",
+            ModelFallback = "未分组",
+            InputField = "uncached_input_tokens",
+            OutputField = "output_tokens",
+            CachedInputField = "cache_read_input_tokens",
+            CacheWriteField = "cache_creation.ephemeral_5m_input_tokens,cache_creation.ephemeral_1h_input_tokens",
+            InputIncludesCached = false,
+            PageTokenField = "next_page",
+            PageParam = "page",
+            HasMoreField = "has_more",
+            LimitParam = "limit",
+            LimitPerRequest = 31,
+            WindowMaxDays = 31,
+            LagMinutes = 10,          // 官方称数据通常 5 分钟内到位，建议 1 次/分钟轮询
+            InitialBackfillDays = 7,
+        }),
+
+        new("OpenAI 兼容用量接口（通用模板）", "结构占位模板，字段名未核实，接前自己改", () => new ProviderConfig
+        {
+            DisplayName = "OpenAI 兼容用量",
+            BaseUrl = "",
+            Path = "/organization/usage/completions",
+            AuthHeader = "Authorization",
+            AuthPrefix = "Bearer ",
+            ApiKeyEnvVar = "TOKEN_METER_API_KEY",
+            StartParam = "start_date",
+            EndParam = "end_date",
+            TimeFormat = "date",
+            ExtraQuery = "bucket_width=1d",
+            ItemsPath = "data",
+            TimeField = "period.start",
+            ModelField = "model",
+            InputField = "input_tokens",
+            OutputField = "output_tokens",
+            CachedInputField = "input_cached_tokens",
+            InputIncludesCached = true,
+            PageTokenField = "next_page",
+            PageParam = "after",
+            HasMoreField = "has_more",
+            WindowMaxDays = 30,
+            LagMinutes = 120,
+        }),
+    };
 }
 
 /// <summary>同步水位线等跨进程状态，存在插件目录 .cache 里，随卸载一起删除。</summary>

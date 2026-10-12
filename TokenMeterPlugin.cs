@@ -641,6 +641,21 @@ public sealed class TokenMeterPlugin : IslandPluginBase
         provRow2.Children.Add(backfillBox);
         page.Children.Add(Card(provRow2));
 
+        // 预设：把「接一家要改哪十来个字段」变成一次选择。套用后仍要自己填 BaseUrl 与环境变量密钥。
+        var presetBox = new ComboBox
+        {
+            Header = "套用接口预设",
+            MinWidth = 320,
+            HorizontalAlignment = HorizontalAlignment.Left,
+        };
+        foreach (var pr in ProviderPresets.All) presetBox.Items.Add(pr.Name);
+        presetBox.PlaceholderText = "选一个，再点右边按钮";
+        var applyPreset = new Button { Content = "套用所选预设", VerticalAlignment = VerticalAlignment.Center };
+        var presetRow = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 12 };
+        presetRow.Children.Add(presetBox);
+        presetRow.Children.Add(applyPreset);
+        page.Children.Add(Card(presetRow));
+
         // 高级：整份配置直接改。Parse 对坏 JSON 会静默回默认值，所以这里先严格校验再落盘。
         var jsonBox = new TextBox
         {
@@ -700,6 +715,35 @@ public sealed class TokenMeterPlugin : IslandPluginBase
         page.Children.Add(jsonToggle);
         page.Children.Add(jsonBox);
         page.Children.Add(jsonStatus);
+
+        // 套用预设：不改用户当前的联网开关，也不保存任何密钥
+        applyPreset.Click += (_, _) =>
+        {
+            var idx = presetBox.SelectedIndex;
+            if (idx < 0 || idx >= ProviderPresets.All.Length)
+            {
+                Status("先从下拉里选一个预设。");
+                return;
+            }
+
+            var preset = ProviderPresets.All[idx];
+            var cfg = preset.Build();
+            cfg.Enabled = ProviderConfig.Parse(Settings.Get("provider", string.Empty)).Enabled;
+            var alias = (provNameBox.Text ?? string.Empty).Trim();
+            if (alias.Length > 0) cfg.DisplayName = alias;
+
+            Settings.Set("provider", cfg.ToJson());   // 触发 OnProviderConfigChanged → 重新拉取
+
+            if (provToggle.IsOn != cfg.Enabled) provToggle.IsOn = cfg.Enabled;
+            baseUrlBox.Text = cfg.BaseUrl;
+            pathBox.Text = cfg.Path;
+            envBox.Text = cfg.ApiKeyEnvVar;
+            winBox.Text = cfg.WindowMaxDays.ToString(CultureInfo.InvariantCulture);
+            lagBox.Text = cfg.LagMinutes.ToString(CultureInfo.InvariantCulture);
+            backfillBox.Text = cfg.InitialBackfillDays.ToString(CultureInfo.InvariantCulture);
+            jsonBox.Text = cfg.ToJson();
+            Status($"已套用「{preset.Name}」（{preset.Basis}）。密钥请自己设进环境变量 {cfg.ApiKeyEnvVar}，插件不保存它。");
+        };
 
         // ---- 模型单价表 ----
         page.Children.Add(new TextBlock
