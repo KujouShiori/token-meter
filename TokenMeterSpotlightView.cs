@@ -225,7 +225,7 @@ public sealed class TokenMeterSpotlightView : UserControl
         _kpiHit.Text = $"{Format.Percent(s.Today.C.CacheHitRate)}";
 
         RebuildBars(s, cur);
-        RebuildTable(s, cur);
+        RebuildTable(s);
         RebuildExtraBlocks(s);
     }
 
@@ -259,21 +259,6 @@ public sealed class TokenMeterSpotlightView : UserControl
                 TextWrapping = TextWrapping.Wrap,
                 Foreground = _mutedBrush,
             });
-
-            foreach (var m in b.TodayByModel.Take(6))
-            {
-                var serverCost = m.C.FromServer && m.C.Cost > 0;
-                _extra.Children.Add(TableRow(
-                    m.Model,
-                    m.C.Requests.ToString(System.Globalization.CultureInfo.InvariantCulture),
-                    Format.Tokens(m.C.Input),
-                    Format.Tokens(m.C.Output),
-                    Format.Tokens(m.C.CacheRead),
-                    Format.Tokens(m.C.Total),
-                    serverCost ? Format.Money(b.Currency, (decimal)m.C.Cost)
-                        : (m.Priced ? Format.Money(b.Currency, m.Cost) : "未定价"),
-                    header: false));
-            }
         }
     }
 
@@ -339,11 +324,14 @@ public sealed class TokenMeterSpotlightView : UserControl
         }
     }
 
-    private void RebuildTable(Snapshot s, string cur)
+    private void RebuildTable(Snapshot s)
     {
         _table.Children.Clear();
 
-        if (s.TodayByModel.Count == 0)
+        var blocks = s.Blocks;
+        var multi = blocks.Count > 1;
+
+        if (blocks.Count == 0 || blocks.All(b => b.TodayByModel.Count == 0))
         {
             _table.Children.Add(new TextBlock
             {
@@ -357,31 +345,57 @@ public sealed class TokenMeterSpotlightView : UserControl
         _table.Children.Add(TableRow("模型", "请求", "输入", "输出", "缓存读", "合计", "费用", header: true));
 
         var shown = 0;
-        foreach (var m in s.TodayByModel)
+        foreach (var b in blocks)
         {
-            if (shown >= 12)
+            // 多来源时在每组前插一行归属标签：两个运营商的钱包在一张表里，必须能看出哪行是谁的
+            if (multi)
             {
                 _table.Children.Add(new TextBlock
                 {
-                    Text = $"…另有 {s.TodayByModel.Count - shown} 个模型未列出",
+                    Text = $"{b.Name} ｜ {b.Currency} ｜ {b.Today.CostBasis}",
                     FontSize = D(11),
-                    Foreground = _faintBrush,
-                    Margin = new Thickness(0, S(4), 0, 0),
+                    Foreground = _accentBrush,
+                    Margin = new Thickness(0, S(6), 0, S(2)),
                 });
-                break;
             }
-            _table.Children.Add(TableRow(
-                m.Model,
-                m.C.Requests.ToString(System.Globalization.CultureInfo.InvariantCulture),
-                Format.Tokens(m.C.Input),
-                Format.Tokens(m.C.Output),
-                Format.Tokens(m.C.CacheRead),
-                Format.Tokens(m.C.Total),
-                (m.C.FromServer && m.C.Cost > 0)
-                    ? Format.Money(cur, (decimal)m.C.Cost)
-                    : (m.Priced ? Format.Money(cur, m.Cost) : "未定价"),
-                header: false));
-            shown++;
+
+            if (b.TodayByModel.Count == 0)
+            {
+                _table.Children.Add(TableRow(
+                    "（今日无用量）", "—", "—", "—", "—", "—",
+                    $"累计 {Format.Money(b.Currency, b.All.Cost)}",
+                    header: false));
+                continue;
+            }
+
+            foreach (var m in b.TodayByModel)
+            {
+                if (shown >= 12)
+                {
+                    _table.Children.Add(new TextBlock
+                    {
+                        Text = $"…另有 {b.TodayByModel.Count - shown} 个模型未列出",
+                        FontSize = D(11),
+                        Foreground = _faintBrush,
+                        Margin = new Thickness(0, S(4), 0, 0),
+                    });
+                    break;
+                }
+                // 服务端报了金额就优先用它，否则才是本地单价估算；用各自来源的币种
+                var serverCost = m.C.FromServer && m.C.Cost > 0;
+                _table.Children.Add(TableRow(
+                    m.Model,
+                    m.C.Requests.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                    Format.Tokens(m.C.Input),
+                    Format.Tokens(m.C.Output),
+                    Format.Tokens(m.C.CacheRead),
+                    Format.Tokens(m.C.Total),
+                    serverCost
+                        ? Format.Money(b.Currency, (decimal)m.C.Cost)
+                        : (m.Priced ? Format.Money(b.Currency, m.Cost) : "未定价"),
+                    header: false));
+                shown++;
+            }
         }
     }
 
