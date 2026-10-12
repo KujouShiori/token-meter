@@ -133,7 +133,7 @@ public sealed class TokenMeterPlugin : IslandPluginBase
         OwnerAccent = Windows.UI.Color.FromArgb(255, 0, 122, 255),
         MorphView = _view,
         CompactSize = new Windows.Foundation.Size(268, 44),
-        ExpandedSize = new Windows.Foundation.Size(430, 166),
+        ExpandedSize = new Windows.Foundation.Size(430, 188),
         OnTap = OpenSpotlight,          // 点击岛体 = 打开聚光卡（§16 规则 2）
     };
 

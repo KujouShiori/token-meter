@@ -21,7 +21,8 @@ public sealed class TokenMeterView : UserControl, IMorphView
     private const double ExpandedIconSize = 22;
     private const double CompactCostSize = 15;
     private const double ExpandedCostSize = 19;
-    private const double ExpandedDetailHeight = 110;
+    private const double BaseDetailHeight = 110;
+    private double _detailHeight = BaseDetailHeight;
     private const int MaxModelRows = 3;
 
     /// <summary>与宿主内置视图同一条 BackEase 曲线的幅度。</summary>
@@ -35,6 +36,7 @@ public sealed class TokenMeterView : UserControl, IMorphView
     private readonly StackPanel _detail;
     private readonly TextBlock _breakdown;
     private readonly StackPanel _modelRows;
+    private readonly StackPanel _otherHost;
     private readonly TextBlock _totals;
 
     private readonly SolidColorBrush _textBrush = new();
@@ -93,11 +95,14 @@ public sealed class TokenMeterView : UserControl, IMorphView
 
         _breakdown = new TextBlock { FontSize = 11.5, TextWrapping = TextWrapping.NoWrap, Foreground = _mutedBrush };
         _modelRows = new StackPanel { Spacing = 1 };
+        // 其他来源（云端）各占一行；没云端数据时这块为空，展开高度会自动缩回去
+        _otherHost = new StackPanel { Spacing = 1 };
         _totals = new TextBlock { FontSize = 11.5, Foreground = _mutedBrush };
 
         _detail = new StackPanel { Height = 0, Opacity = 0, Spacing = 3 };
         _detail.Children.Add(_breakdown);
         _detail.Children.Add(_modelRows);
+        _detail.Children.Add(_otherHost);
         _detail.Children.Add(_totals);
 
         var header = new StackPanel
@@ -171,6 +176,8 @@ public sealed class TokenMeterView : UserControl, IMorphView
             _breakdown.Text = "";
             _totals.Text = "";
             _modelRows.Children.Clear();
+            _otherHost.Children.Clear();
+            _detailHeight = BaseDetailHeight;
             return;
         }
 
@@ -213,6 +220,32 @@ public sealed class TokenMeterView : UserControl, IMorphView
                 Foreground = _faintBrush,
             });
         }
+
+        // 其他来源各一行：岛面空间有限，一个来源只给一行，多了仍然去聚光卡看
+        _otherHost.Children.Clear();
+        var otherRows = 0;
+        for (var i = 1; i < s.Blocks.Count; i++)
+        {
+            var b = s.Blocks[i];
+            var pricedB = b.Today.Models - b.Today.UnpricedModels;
+            string costText;
+            if (!b.HasData || b.Today.C.Total <= 0)
+                costText = $"今日无 · 累计 {Format.Money(b.Currency, b.All.Cost)}";
+            else if (b.Today.CostBasis == "本地估算" && pricedB <= 0)
+                costText = "未定价";
+            else
+                costText = Format.Money(b.Currency, b.Today.Cost);
+
+            _otherHost.Children.Add(new TextBlock
+            {
+                Text = $"{b.Name}  {Format.Tokens(b.Today.C.Total)} tok  {costText}",
+                FontSize = 11.5,
+                Foreground = _mutedBrush,
+                TextTrimming = TextTrimming.CharacterEllipsis,
+            });
+            otherRows++;
+        }
+        _detailHeight = BaseDetailHeight + otherRows * 16;
 
         _totals.Text = $"本周 {Format.Money(s.Currency, s.Week.Cost)} · 本月 {Format.Money(s.Currency, s.Month.Cost)} · 累计 {Format.Money(s.Currency, s.All.Cost)}";
     }
@@ -327,7 +360,7 @@ public sealed class TokenMeterView : UserControl, IMorphView
     {
         _progress = progress;
 
-        _detail.Height = Math.Max(0, ExpandedDetailHeight * progress);
+        _detail.Height = Math.Max(0, _detailHeight * progress);
         _detail.Opacity = Math.Clamp(progress, 0, 1);
 
         _icon.FontSize = CompactIconSize + (ExpandedIconSize - CompactIconSize) * progress;
