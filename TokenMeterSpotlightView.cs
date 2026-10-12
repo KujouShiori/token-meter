@@ -46,7 +46,7 @@ public sealed class TokenMeterSpotlightView : UserControl
 
     private readonly IIslandTheme _theme;
     private readonly StackPanel _kpiHost;
-    private readonly StackPanel _bars;
+    private readonly Grid _bars;
     private readonly StackPanel _table;
     private readonly TextBlock _source;
     private readonly Button _refresh;
@@ -92,12 +92,10 @@ public sealed class TokenMeterSpotlightView : UserControl
         _source = new TextBlock { FontSize = T(11), Foreground = _faintBrush, TextWrapping = TextWrapping.Wrap };
 
         _kpiHost = new StackPanel { Spacing = S(12) };
-        _bars = new StackPanel
-        {
-            Orientation = Orientation.Horizontal,
-            Spacing = S(10),
-            HorizontalAlignment = HorizontalAlignment.Center,
-        };
+        // 用 7 等分星型列而不是固定宽 StackPanel：
+        // 之前每格写死 93.8，7 格共 707.3，超过卡片可用的 688.8，
+        // 而横向滚动是禁用的，于是最右那一格被挤裁。星型列永远适配卡片宽度。
+        _bars = new Grid();
         _table = new StackPanel { Spacing = S(2) };
 
         var chartLabel = new TextBlock { Text = "近 7 天用量", FontSize = D(13), Foreground = _mutedBrush };
@@ -248,6 +246,7 @@ public sealed class TokenMeterSpotlightView : UserControl
     private void RebuildBars(Snapshot s)
     {
         _bars.Children.Clear();
+        _bars.ColumnDefinitions.Clear();
         var blocks = s.Blocks;
         if (blocks.Count == 0) return;
 
@@ -263,13 +262,15 @@ public sealed class TokenMeterSpotlightView : UserControl
 
         var corner = new CornerRadius(S(4));
         var barWidth = D(30);
-        var colWidth = D(34);
 
         for (var i = 0; i < days; i++)
         {
             var day = blocks[0].Last7[i].Day;
 
-            var col = new StackPanel { Spacing = S(3), Width = colWidth * Math.Max(1, blocks.Count) };
+            _bars.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+
+            // 不再给列固定 Width，交给星型列均分；内部元素居中
+            var col = new StackPanel { Spacing = S(3), HorizontalAlignment = HorizontalAlignment.Center };
 
             // 金额标签：按来源顺序各一行（第一行本地、第二行云端）
             for (var b = 0; b < blocks.Count; b++)
@@ -362,6 +363,7 @@ public sealed class TokenMeterSpotlightView : UserControl
                 TextAlignment = TextAlignment.Center,
             });
 
+            Grid.SetColumn(col, i);
             _bars.Children.Add(col);
         }
     }
