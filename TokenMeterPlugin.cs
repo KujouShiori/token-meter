@@ -290,6 +290,7 @@ public sealed class TokenMeterPlugin : IslandPluginBase
     {
         var blocks = new List<SourceBlock>();
         var splitNote = string.Empty;
+        var splitWarning = string.Empty;
         var haveServer = cfg.Enabled && _serverLedger is not null && _serverLedger.Days.Count > 0;
 
         SourceBlock primary;
@@ -309,6 +310,7 @@ public sealed class TokenMeterPlugin : IslandPluginBase
             blocks.Add(lb);
             blocks.Add(sb);
             splitNote = split.Note;
+            splitWarning = split.DroppedNote;
             primary = lb.HasData ? lb : sb;
         }
         else
@@ -329,6 +331,7 @@ public sealed class TokenMeterPlugin : IslandPluginBase
             ProviderSummary = cfg.Enabled ? cfg.SafeSummary() : "服务端接口未启用",
             CoveredUntilUtc = haveServer ? _coveredUntilUtc : null,
             ProviderNote = note,
+            SplitWarning = haveServer ? splitWarning : string.Empty,
         };
         SnapshotBuilder.CopyBlock(snap, primary);
         return snap;
@@ -507,7 +510,7 @@ public sealed class TokenMeterPlugin : IslandPluginBase
         Context.Island.OpenSpotlight(new IslandSpotlight
         {
             Content = _spotlightView,
-            Size = new Windows.Foundation.Size(616, 476),   // 880×680 的 70%；内容已按同一系数缩排版
+            Size = new Windows.Foundation.Size(TokenMeterSpotlightView.CardWidth, TokenMeterSpotlightView.CardHeight),
             OnClosed = () =>
             {
                 var v = _spotlightView;
@@ -550,6 +553,7 @@ public sealed class TokenMeterPlugin : IslandPluginBase
 
         // 这三条不是说明文字，而是「出事才会出现」的告警：接口降级/对账偏低、扫描提示、扫描出错
         if (!string.IsNullOrEmpty(s.ProviderNote)) parts.Add(s.ProviderNote);
+        if (!string.IsNullOrEmpty(s.SplitWarning)) parts.Add(s.SplitWarning);
         if (!string.IsNullOrEmpty(s.Note)) parts.Add($"提示：{s.Note}");
         if (!string.IsNullOrEmpty(s.Error)) parts.Add($"出错：{s.Error}");
 

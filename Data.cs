@@ -164,6 +164,9 @@ public sealed class Snapshot
 
     /// <summary>归属分派说明，例如哪些模型已被云端接管。</summary>
     public string SplitNote { get; set; } = "";
+
+    /// <summary>本地范围外被丢掉的模型：不在卡片上显示，只进设置页状态行。</summary>
+    public string SplitWarning { get; set; } = "";
 }
 
 /// <summary>按「本地日期 -> 模型 -> 计数」组织的账本。</summary>

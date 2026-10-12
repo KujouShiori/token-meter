@@ -71,7 +71,10 @@ public sealed class SplitInfo
     public List<string> ServerOnly { get; } = new();
     /// <summary>本地范围填了、但模型不在范围内 → 两边都不算。必须告知用户，否则数字会“凭空变少”。</summary>
     public List<string> DroppedByLocalScope { get; } = new();
+    /// <summary>卡片上展示的说明：只讲「哪些模型被云端接管」。</summary>
     public string Note { get; set; } = "";
+    /// <summary>范围外丢掉的模型：不放卡片（太长），只放到设置页状态行。</summary>
+    public string DroppedNote { get; set; } = "";
 }
 
 /// <summary>
@@ -148,8 +151,7 @@ public static class LedgerSplitter
             info.Note = $"以下模型已由云端接口接管，本地日志不再重复计入：{string.Join("、", info.MovedToServer)}";
 
         if (info.DroppedByLocalScope.Count > 0)
-            info.Note = (string.IsNullOrEmpty(info.Note) ? "" : info.Note + "；")
-                + $"本地范围未包含这些模型，两边都没统计：{string.Join("、", info.DroppedByLocalScope)}";
+            info.DroppedNote = $"本地范围未包含这些模型，两边都没统计：{string.Join("、", info.DroppedByLocalScope)}";
 
         return (localOut, serverOut, info);
     }

@@ -19,14 +19,21 @@ namespace TokenMeter;
 /// </summary>
 public sealed class TokenMeterSpotlightView : UserControl
 {
-    /// <summary>几何缩放：0.7 = 卡片比原来小 30%。只管内边距、间距、柱高这些不随字号变的东西。</summary>
-    private const double LayoutScale = 0.7;
+    /// <summary>整体缩放：1.2 = 卡片与内部排版一起比原来大 20%（只改这一个数就能调大小）。</summary>
+    public const double Zoom = 1.2;
 
-    /// <summary>文字缩放：0.9 = 标题与 KPI 在原始字号上略微收一点。</summary>
-    private const double TextScale = 0.9;
+    /// <summary>聚光卡尺寸，供插件侧 OpenSpotlight 使用，保证与内部缩放同源。</summary>
+    public const double CardWidth = 616 * Zoom;
+    public const double CardHeight = 476 * Zoom;
 
-    /// <summary>图表与明细表单独再放大一档。</summary>
-    private const double DataTextScale = 1.15;
+    /// <summary>几何缩放：0.7 × Zoom。只管内边距、间距、柱高这些不随字号变的东西。</summary>
+    private const double LayoutScale = 0.7 * Zoom;
+
+    /// <summary>文字缩放：0.9 × Zoom。</summary>
+    private const double TextScale = 0.9 * Zoom;
+
+    /// <summary>图表与明细表再放大一档：1.15 × Zoom。</summary>
+    private const double DataTextScale = 1.15 * Zoom;
 
     private static double S(double v) => v * LayoutScale;
     private static double T(double v) => v * TextScale;
