@@ -202,7 +202,7 @@ public sealed class TokenMeterSpotlightView : UserControl
         var todayPriced = s.Today.Models - s.Today.UnpricedModels;
 
         // 口径变了必须看得出来：接口挂了在后台静默降级比报错更难发现
-        _source.Text = s.SourceMode + (s.CoveredUntilUtc is null
+        _source.Text = s.SourceMode + $" ｜ 费用口径：{s.Today.CostBasis}" + (s.CoveredUntilUtc is null
             ? string.Empty
             : $"（服务端覆盖到 {Format.Ago(s.CoveredUntilUtc.Value)}）")
             + (string.IsNullOrEmpty(s.ProviderNote) ? string.Empty : " · " + s.ProviderNote);
@@ -260,7 +260,7 @@ public sealed class TokenMeterSpotlightView : UserControl
             var col = new StackPanel { Spacing = S(3), Width = colWidth };
             col.Children.Add(new TextBlock
             {
-                // 金额写全（用户要求），靠加粗柱子带来的列宽容纳
+                // 金额写全，靠加粗柱子带来的列宽容纳
                 Text = useCost ? Format.Money(cur, p.Cost) : Format.Tokens(p.Total),
                 FontSize = D(10.5),
                 Foreground = _mutedBrush,
@@ -320,7 +320,9 @@ public sealed class TokenMeterSpotlightView : UserControl
                 Format.Tokens(m.C.Output),
                 Format.Tokens(m.C.CacheRead),
                 Format.Tokens(m.C.Total),
-                m.Priced ? Format.Money(cur, m.Cost) : "未定价",
+                (m.C.FromServer && m.C.Cost > 0)
+                    ? Format.Money(cur, (decimal)m.C.Cost)
+                    : (m.Priced ? Format.Money(cur, m.Cost) : "未定价"),
                 header: false));
             shown++;
         }

@@ -145,9 +145,37 @@ WinIsland / WinLand 灵动岛插件：实时显示本机 AI 会话的 **token �
 
 > 代码默认的 input_tokens / input_cached_tokens / after / Authorization: Bearer 只是示例写法，**不要当成 OpenAI 的事实**；要接 OpenAI 请先自己核对其字段名与限制再改预设。
 
+### New API / One API 网关（逐请求日志）
+
+很多中转站、公益站都是 New API 改的（看 `api/status` 能认出来）。用预设里的
+「New API / One API 网关（用量日志）」，关键取值：
+
+| 配置 | 值 | 为什么 |
+|---|---|---|
+| Path | /api/log/self | 逐请求消耗日志（type=2 只看消耗） |
+| AuthHeader / AuthPrefix | Authorization / 空 | 控制台接口用**裸令牌**，不带 Bearer |
+| ExtraHeaders | New-Api-User=<你的用户ID> | **少了这个头直接 401**；ID 在控制台头像旁 |
+| ApiKeyEnvVar | 存「系统访问令牌」的变量名 | 不是 sk- 推理 key，两者不通用 |
+| ItemsPath | data.items | 条目嵌在 data 对象里 |
+| TimeField / TimeFormat | created_at / unix | 时间是 **unix 秒** |
+| CachedInputField | other.cache_tokens | other 是**字符串里包的 JSON**，插件会自动解开再取 |
+| CostField / CostUnitDivisor | quota / 500000 | New API 记账单位，**500000 = $1** |
+| PageMode | page（page/per_page/data.total） | 它没有 next_page 游标，只能按页码翻 |
+
+实测对照：quota ÷ 500000 算出的余额与控制台页面**完全一致**（$249.90 / $0.10 / 1 次）；
+而 other 里的系数直接回答了「缓存该多少钱」：cache_ratio=0.5（缓存读是输入价的 50%）、
+cache_creation_ratio=1.25（缓存写 125%）、completion_ratio=3（输出是输入的 3 倍）。
+
+⚠️ 一个**尚未证实的假设**：预设里 InputIncludesCached=true（即 prompt_tokens 已包含缓存部分）。
+这是 New API 惯例，但你的账号里**还没出现过 cache_tokens > 0 的样本**，无法用数据验证。
+接上后请拿一天的服务端 quota 总额与网关账单对一次；对不上就把这个开关改成 false 再看。
+
+⚠️ 隐私：/api/user/self 会返回邮箱、邀请码等账号字段。本插件**只读 /api/log/self 的白名单字段**
+（时间、模型名、三个 token 数、quota），不会把整包响应写进日志或缓存。
+
 ## 致谢与代码来源
 
-接口层的三个实现思路——**声明式厂商模板 + JSON 路径取值（含数组下标）+ scale 乘数**、**从 2xx 响应体里提炼业务层错误**、**发请求前的地址安全卡控**——参考自 [MeteorNOX/DeepSeek-Balance-Whale-Widget](https://github.com/MeteorNOX/DeepSeek-Balance-Whale-Widget)（其 lib/ 部分为 MIT 许可，作者已同意复用这三个实现方法）。
+接口层的四个实现思路——**声明式厂商模板 + JSON 路径取值（含数组下标）+ scale 乘数**、**从 2xx 响应体里提炼业务层错误**、**发请求前的地址安全卡控**、**金额用 1e-8 定点整数记账（避免浮点累加误差）**——参考自 [MeteorNOX/DeepSeek-Balance-Whale-Widget](https://github.com/MeteorNOX/DeepSeek-Balance-Whale-Widget)（其 lib/ 部分为 MIT 许可，作者已同意复用这几个实现方法）。
 
 本仓库只按这些思路用 C# 重新实现，**没有复制它的任何文件**，也没有使用其 assets/ 与 icon.png（按其 PROVENANCE.md，那部分不在 MIT 覆盖范围内）。
 

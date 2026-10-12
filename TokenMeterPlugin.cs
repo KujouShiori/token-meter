@@ -496,6 +496,7 @@ public sealed class TokenMeterPlugin : IslandPluginBase
         {
             $"更新于 {Format.Ago(s.GeneratedUtc)}（{Format.Clock(s.GeneratedUtc)}）",
             $"当前口径：{s.SourceMode}",
+            $"费用口径：{s.Today.CostBasis}",
         };
 
         // 这三条不是说明文字，而是「出事才会出现」的告警：接口降级/对账偏低、扫描提示、扫描出错

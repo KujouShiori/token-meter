@@ -26,6 +26,12 @@ public sealed class ProviderFetchResult
     public int Windows { get; set; }
     public int Pages { get; set; }
     public long BytesIn { get; set; }
+    /// <summary>服务端报回的金额合计（元）。</summary>
+    public double ServerCost { get; set; }
+    /// <summary>本次拉取里实际计入的条目数，用于页码分页判断是否翻完。</summary>
+    public int ItemsInWindow { get; set; }
+
+    /// <summary>接口是否给了请求次数字段（没给的话界面不能把服务端的 0 当成真实请求数）。</summary>
     public bool HadRequestsField { get; set; }
 }
 
@@ -65,7 +71,9 @@ public sealed class ProviderClient : IDisposable
             throw new ProviderException($"环境变量 {cfg.ApiKeyEnvVar.Trim()} 没有值", permanent: true);
 
         var result = new ProviderFetchResult { CoveredUntilUtc = toUtc };
-        var cursor = string.Empty;
+        var pageMode = string.Equals(cfg.PageMode, "page", StringComparison.OrdinalIgnoreCase);
+        var pageNo = cfg.PageStart;
+        var cursor = pageMode ? pageNo.ToString(CultureInfo.InvariantCulture) : string.Empty;
         var pages = 0;
 
         while (true)
@@ -153,7 +161,36 @@ public sealed class ProviderClient : IDisposable
                         AbsorbItem(cfg, owner, item, result);
                     }
 
-                    // 分页：游标字段为空即结束；has_more 存在且为 false 也结束
+                    // 分页：page 模式按页码递增，用 total / 本页数量判断翻完；
+                    // cursor 模式看响应里的游标字段，has_more 为 false 也结束
+                    if (pageMode)
+                    {
+                        result.ItemsInWindow += pairs.Count;
+                        pages++;
+                        result.Pages = pages;
+
+                        var wantMore = pairs.Count > 0;
+
+                        if (!string.IsNullOrWhiteSpace(cfg.TotalField)
+                            && TryNavigate(root, cfg.TotalField, out var totalEl)
+                            && totalEl.ValueKind == JsonValueKind.Number)
+                        {
+                            wantMore = result.ItemsInWindow < (long)totalEl.GetDouble();
+                        }
+                        else if (cfg.PageSize > 0)
+                        {
+                            wantMore = pairs.Count >= cfg.PageSize;
+                        }
+
+                        if (!wantMore) break;
+                        if (pages >= cfg.MaxPagesPerWindow)
+                            throw new ProviderException($"分页超过上限 {cfg.MaxPagesPerWindow} 页仍未结束——请检查 TotalField/PageSize 是否配对");
+
+                        pageNo++;
+                        cursor = pageNo.ToString(CultureInfo.InvariantCulture);
+                        continue;
+                    }
+
                     cursor = string.Empty;
                     if (!string.IsNullOrWhiteSpace(cfg.PageTokenField)
                         && TryNavigate(root, cfg.PageTokenField, out var tokenEl))
@@ -335,10 +372,21 @@ public sealed class ProviderClient : IDisposable
             CacheRead = cached,
             CacheWrite = cacheWrite,
             Requests = requests,
+            // 服务端拉回来的数据一律打来源标记，上游才能区分「服务端金额只盖了部分天」
+            Src = 1,
         };
         c.Total = c.Input + c.Output + c.CacheRead + c.CacheWrite;
         if (c.Total <= 0) return;
 
+        if (!string.IsNullOrWhiteSpace(cfg.CostField))
+        {
+            var divisor = cfg.CostUnitDivisor > 0 && !double.IsNaN(cfg.CostUnitDivisor) && !double.IsInfinity(cfg.CostUnitDivisor)
+                ? cfg.CostUnitDivisor : 1;
+            var rawCost = ReadNumber(item, cfg.CostField, 1);
+            if (rawCost > 0) c.AddCost(rawCost / divisor);
+        }
+
+        result.ServerCost += c.Cost;
         result.Ledger.Add(dayKey, model!, c);
         if (utc > result.CoveredUntilUtc) result.CoveredUntilUtc = utc;
     }
@@ -348,20 +396,92 @@ public sealed class ProviderClient : IDisposable
     {
         if (string.IsNullOrWhiteSpace(paths)) return 0;
         double sum = 0;
-        foreach (var path in paths.Split(',', StringSplitOptions.RemoveEmptyEntries))
+        foreach (var raw in paths.Split(',', StringSplitOptions.RemoveEmptyEntries))
         {
-            if (!TryNavigate(item, path.Trim(), out var el)) continue;
-            sum += el.ValueKind switch
+            // 解析出的内嵌文档必须比取到的 JsonElement 活得更久，所以在本轮循环里持有再释放
+            var docs = new List<JsonDocument>();
+            try
             {
-                JsonValueKind.Number => el.TryGetInt64(out var l) ? l : el.GetDouble(),
-                JsonValueKind.String => double.TryParse(el.GetString(), NumberStyles.Float, CultureInfo.InvariantCulture, out var p)
-                    ? p : 0,
-                _ => 0,
-            };
+                if (!TryNavigateDeep(item, raw.Trim(), out var el, docs)) continue;
+                sum += el.ValueKind switch
+                {
+                    JsonValueKind.Number => el.TryGetInt64(out var l) ? l : el.GetDouble(),
+                    JsonValueKind.String => double.TryParse(el.GetString(), NumberStyles.Float, CultureInfo.InvariantCulture, out var p)
+                        ? p : 0,
+                    _ => 0,
+                };
+            }
+            finally
+            {
+                foreach (var d in docs) d.Dispose();
+            }
         }
         if (sum == 0) return 0;
         var s = scale > 0 && !double.IsNaN(scale) && !double.IsInfinity(scale) ? scale : 1.0;
         return (long)Math.Round(sum * s, MidpointRounding.AwayFromZero);
+    }
+
+    /// <summary>
+    /// 与 TryNavigate 同构，但遇到「值本身是一段 JSON 文本」时会自动解开再继续往下走——
+    /// New API 的 other 字段就是字符串里包的 JSON（cache_tokens / cache_ratio 都在里面）。
+    /// 解出来的文档放进调用方持有的 keep 里：JsonElement 不能比它的 JsonDocument 活得更久。
+    /// </summary>
+    internal static bool TryNavigateDeep(JsonElement root, string path, out JsonElement found, List<JsonDocument> keep)
+    {
+        found = default;
+        if (string.IsNullOrWhiteSpace(path)) return false;
+
+        var cur = root;
+        var i = 0;
+        while (i < path.Length)
+        {
+            if (cur.ValueKind == JsonValueKind.String)
+            {
+                var s = cur.GetString();
+                if (string.IsNullOrWhiteSpace(s) || (s[0] != '{' && s[0] != '[')) return false;
+                JsonDocument parsed;
+                try { parsed = JsonDocument.Parse(s); }
+                catch (JsonException) { return false; }
+                keep.Add(parsed);
+                cur = parsed.RootElement;
+            }
+
+            var start = i;
+            while (i < path.Length && path[i] != '.' && path[i] != '[') i++;
+            if (i > start)
+            {
+                if (cur.ValueKind != JsonValueKind.Object) return false;
+                if (!cur.TryGetProperty(path.Substring(start, i - start), out cur)) return false;
+            }
+
+            while (i < path.Length && path[i] == '[')
+            {
+                var close = path.IndexOf(']', i);
+                if (close < 0) return false;
+                if (!int.TryParse(path.AsSpan(i + 1, close - i - 1), NumberStyles.Integer, CultureInfo.InvariantCulture, out var idx))
+                    return false;
+                if (cur.ValueKind != JsonValueKind.Array) return false;
+                JsonElement? hit = null;
+                var pos = -1;
+                foreach (var el in cur.EnumerateArray())
+                {
+                    pos++;
+                    if (pos != idx) continue;
+                    hit = el;
+                    break;
+                }
+                if (hit is null || idx < 0) return false;
+                cur = hit.Value;
+                i = close + 1;
+            }
+
+            if (i < path.Length && path[i] == '.') { i++; continue; }
+            if (i >= path.Length) break;
+            if (path[i] != '[') return false;
+        }
+
+        found = cur;
+        return true;
     }
 
     /// <summary>
@@ -529,6 +649,8 @@ public sealed class ProviderClient : IDisposable
         }
         if (!string.IsNullOrEmpty(cursor) && !string.IsNullOrWhiteSpace(cfg.PageParam))
             Append(q, cfg.PageParam, cursor);
+        if (!string.IsNullOrWhiteSpace(cfg.PageSizeParam) && cfg.PageSize > 0)
+            AppendRaw(q, cfg.PageSizeParam.Trim(), cfg.PageSize.ToString(CultureInfo.InvariantCulture));
         if (!string.IsNullOrWhiteSpace(cfg.LimitParam) && cfg.LimitPerRequest > 0)
             AppendRaw(q, cfg.LimitParam.Trim(), cfg.LimitPerRequest.ToString(CultureInfo.InvariantCulture));
 

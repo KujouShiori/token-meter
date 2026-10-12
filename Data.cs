@@ -12,6 +12,25 @@ public sealed class Counters
     public long Total { get; set; }
     public long Requests { get; set; }
 
+    /// <summary>服务端报回的金额，以 1e-8 元为单位的定点整数（避免浮点累加误差）。
+    /// 本地估算的费用不放这里——这里只存「服务端权威金额」，两套口径不能混。</summary>
+    public long CostUnits { get; set; }
+
+    /// <summary>服务端金额（元）。</summary>
+    public double Cost => CostUnits / 1e8;
+
+    /// <summary>数据来源：0 = 本地会话日志，1 = 服务端接口。混在一本账里时必须能区分，
+    /// 否则「服务端金额只盖了部分天」会被当成全量费用显示出去。</summary>
+    public long Src { get; set; }
+
+    public bool FromServer => Src != 0;
+
+    public void AddCost(double yuan)
+    {
+        if (yuan <= 0 || double.IsNaN(yuan) || double.IsInfinity(yuan)) return;
+        CostUnits += (long)Math.Round(yuan * 1e8, MidpointRounding.AwayFromZero);
+    }
+
     public Counters Clone() => new()
     {
         Input = this.Input,
@@ -20,6 +39,8 @@ public sealed class Counters
         CacheWrite = this.CacheWrite,
         Total = this.Total,
         Requests = this.Requests,
+        CostUnits = this.CostUnits,
+        Src = this.Src,
     };
 
     public void Add(Counters o)
@@ -30,6 +51,10 @@ public sealed class Counters
         CacheWrite += o.CacheWrite;
         Total += o.Total;
         Requests += o.Requests;
+        CostUnits += o.CostUnits;
+        // 同一（天、模型）里只要出现过服务端数据就计为服务端来源；
+        // 本地日志与服务端日志重叠时，上游已经以「整天覆盖」的方式选过边
+        if (o.Src != 0) Src = o.Src;
     }
 
     /// <summary>缓存命中率：读缓存占「输入侧总量」的比例。</summary>
@@ -43,8 +68,8 @@ public sealed class Counters
         }
     }
 
-    /// <summary>缓存区间的 6 个值，顺序固定：输入/输出/缓存读/缓存写/合计/请求数。</summary>
-    public long[] ToArray() => new[] { Input, Output, CacheRead, CacheWrite, Total, Requests };
+    /// <summary>缓存区间的 8 个值，顺序固定：输入/输出/缓存读/缓存写/合计/请求数/服务端金额/来源。</summary>
+    public long[] ToArray() => new[] { Input, Output, CacheRead, CacheWrite, Total, Requests, CostUnits, Src };
 
     public static Counters FromArray(long[]? a)
     {
@@ -57,6 +82,8 @@ public sealed class Counters
             CacheWrite = a[3],
             Total = a[4],
             Requests = a[5],
+            CostUnits = a.Length >= 7 ? a[6] : 0,
+            Src = a.Length >= 8 ? a[7] : 0,
         };
     }
 }
@@ -78,6 +105,13 @@ public sealed class WindowAgg
     public int Models { get; set; }
     public int UnpricedModels { get; set; }
     public bool HasUnpriced => UnpricedModels > 0;
+
+    /// <summary>服务端报回的金额合计（元）。</summary>
+    public double ServerCost { get; set; }
+    /// <summary>来自服务端的 token 量，用于判断服务端金额是否覆盖了这个窗口。</summary>
+    public long ServerTokens { get; set; }
+    /// <summary>展示用费用的口径：服务端 / 本地估算 / 混合。</summary>
+    public string CostBasis { get; set; } = "本地估算";
 }
 
 /// <summary>近 N 天里某一天的用量点。</summary>
@@ -208,6 +242,11 @@ internal sealed class Bucket
     {
         Agg.C.Add(c);
         Agg.Cost += cost;
+        if (c.FromServer)
+        {
+            Agg.ServerCost += c.Cost;
+            Agg.ServerTokens += c.Total;
+        }
 
         if (!ByModel.TryGetValue(model, out var mu))
         {
@@ -279,6 +318,11 @@ public static class SnapshotBuilder
         snap.Month = monthB.Agg;
         snap.All = allB.Agg;
 
+        ApplyCostBasis(snap.Today);
+        ApplyCostBasis(snap.Week);
+        ApplyCostBasis(snap.Month);
+        ApplyCostBasis(snap.All);
+
         snap.TodayByModel = todayB.ByModel.Values
             .OrderByDescending(m => m.Cost)
             .ThenByDescending(m => m.C.Total)
@@ -310,6 +354,30 @@ public static class SnapshotBuilder
 
         snap.HasData = snap.All.C.Total > 0 || snap.All.C.Requests > 0;
         return snap;
+    }
+
+    /// <summary>
+    /// 决定这个窗口的费用口径。只有服务端金额几乎覆盖该窗口全部 token 时，
+    /// 才用服务端金额替掉本地估算；否则保留估算并标成混合，
+    /// 避免把「部分天的服务端数据」当成全量费用报出去。
+    /// </summary>
+    private static void ApplyCostBasis(WindowAgg w)
+    {
+        if (w.ServerCost <= 0 || w.ServerTokens <= 0)
+        {
+            w.CostBasis = "本地估算";
+            return;
+        }
+
+        var coverage = w.C.Total > 0 ? (double)w.ServerTokens / w.C.Total : 0;
+        if (coverage >= 0.99)
+        {
+            w.Cost = (decimal)w.ServerCost;
+            w.CostBasis = "服务端";
+            return;
+        }
+
+        w.CostBasis = $"混合（服务端仅覆盖 {coverage:P0}，仍显示本地估算）";
     }
 
     /// <summary>周一为一周的开始（国内习惯）。</summary>

@@ -66,6 +66,22 @@ public sealed class ProviderConfig
     /// <summary>是否有下一页的布尔字段名。留空 = 只看 PageTokenField 是否非空。</summary>
     public string HasMoreField { get; set; } = "has_more";
 
+    /// <summary>分页方式：cursor = 用响应里的游标字段；
+    /// page = 按页码递增（New API 这类只有 page/per_page/total、没有游标的接口）。</summary>
+    public string PageMode { get; set; } = "cursor";
+
+    /// <summary>page 模式的起始页码（有的接口从 0 开始，有的从 1 开始）。</summary>
+    public int PageStart { get; set; } = 0;
+
+    /// <summary>page 模式下每页条数的参数名与值；参数名留空则不传。</summary>
+    public string PageSizeParam { get; set; } = "";
+
+    public int PageSize { get; set; } = 0;
+
+    /// <summary>page 模式下用于判断是否翻完的总数字段（点号路径）；
+    /// 留空则只靠「本页为空」或「本页不满一页」停下来。</summary>
+    public string TotalField { get; set; } = "";
+
     /// <summary>
     /// 每条记录的时间字段。取数时会先在条目里找，找不到再到「拥有该条目的上层对象」上找——
     /// 因为像 Anthropic 那种两层结构里，时间戳写在外层时间桶上而不是每条明细里。
@@ -101,9 +117,12 @@ public sealed class ProviderConfig
     public bool InputIncludesCached { get; set; } = true;
 
     /// <summary>服务端返回里是否直接带金额字段；带就优先用它，省掉单价推算。</summary>
-    /// <summary>服务端返回里直接带金额的字段。当前版本**尚未接入计费**（费用仍按本地单价算），
-    /// 留作扩展；填了也不会生效，避免接口金额与本地单价两套口径打架。</summary>
+    /// <summary>服务端报回的金额字段（点号路径，支持钻进字符串里的 JSON）。</summary>
     public string CostField { get; set; } = "";
+
+    /// <summary>金额换算率：字段值 ÷ 该值 = 元/美元。
+    /// New API 这类用「500000 单位 = $1」的记账法就填 500000。</summary>
+    public double CostUnitDivisor { get; set; } = 1;
 
     /// <summary>所有 token 数值的统一乘数。接口返回的不是「个」而是「千/百万」时用它校正，默认 1。</summary>
     public double ValueScale { get; set; } = 1;
@@ -245,6 +264,46 @@ public static class ProviderPresets
             LimitPerRequest = 31,
             WindowMaxDays = 31,
             LagMinutes = 10,          // 官方称数据通常 5 分钟内到位，建议 1 次/分钟轮询
+            InitialBackfillDays = 7,
+        }),
+
+        new("New API / One API 网关（用量日志）", "按 ps.air-outer.com 实测响应结构核实", () => new ProviderConfig
+        {
+            DisplayName = "New API 用量日志",
+            BaseUrl = "https://ps.air-outer.com",
+            Path = "/api/log/self",
+            // New API 的控制台接口用裸令牌，不带 Bearer 前缀
+            AuthHeader = "Authorization",
+            AuthPrefix = "",
+            ApiKeyEnvVar = "TOKEN_METER_API_KEY",
+            // 必须把 CHANGE_ME 换成你的用户 ID（控制台右上角头像旁能看到）
+            ExtraHeaders = "New-Api-User=CHANGE_ME",
+            StartParam = "start_timestamp",
+            EndParam = "end_timestamp",
+            TimeFormat = "unix",
+            ExtraQuery = "type=2",            // type=2 = 消耗日志
+            ItemsPath = "data.items",
+            TimeField = "created_at",
+            ModelField = "model_name",
+            ModelFallback = "未分组",
+            InputField = "prompt_tokens",
+            OutputField = "completion_tokens",
+            // other 是「字符串里包的 JSON」，靠 TryNavigateDeep 钻进去
+            CachedInputField = "other.cache_tokens",
+            CacheWriteField = "other.cache_creation_tokens",
+            // New API 惯例：prompt_tokens 已包含缓存命中部分，cache_tokens 是其子集。
+            // ⚠ 这条在你的账号上还没跑到 cache_tokens>0 的样本，接上后请对一次账单再确认
+            InputIncludesCached = true,
+            CostField = "quota",
+            CostUnitDivisor = 500000,          // New API 记账：500000 单位 = $1
+            PageMode = "page",
+            PageStart = 0,
+            PageParam = "page",
+            PageSizeParam = "per_page",
+            PageSize = 50,
+            TotalField = "data.total",
+            WindowMaxDays = 1,                 // 日志是逐条的，按天分段更好翻页
+            LagMinutes = 10,
             InitialBackfillDays = 7,
         }),
 

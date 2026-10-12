@@ -242,11 +242,15 @@ public sealed class TokenMeterView : UserControl, IMorphView
         };
         Grid.SetColumn(tok, 1);
 
+        // 服务端报了金额就优先用它，否则才是本地单价估算
+        var serverCost = m.C.FromServer && m.C.Cost > 0;
         var cost = new TextBlock
         {
-            Text = m.Priced ? Format.Money(currency, m.Cost) : "未定价",
+            Text = serverCost
+                ? Format.Money(currency, (decimal)m.C.Cost)
+                : (m.Priced ? Format.Money(currency, m.Cost) : "未定价"),
             FontSize = 12,
-            Foreground = m.Priced ? _accentBrush : _faintBrush,
+            Foreground = serverCost || m.Priced ? _accentBrush : _faintBrush,
             HorizontalAlignment = HorizontalAlignment.Right,
         };
         Grid.SetColumn(cost, 2);
