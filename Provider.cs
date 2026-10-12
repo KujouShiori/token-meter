@@ -354,6 +354,41 @@ public sealed class ProviderState
     /// <summary>累计从服务端拿到的 token 数，仅用于日志与状态显示。</summary>
     public long ServerTotalTokens { get; set; }
 
+    /// <summary>
+    /// 云端账本本体（天 → 模型 → 计数）。**必须和水位线一起持久化**：
+    /// 只存水位线不存数据的话，重启后水位线会说「这段时间已经拉过了」，
+    /// 而那段时间的数据其实全丢了——云端块会永久归零。
+    /// </summary>
+    public Dictionary<string, Dictionary<string, long[]>> ServerDays { get; set; } = new();
+
+    public void SaveLedger(UsageLedger? ledger)
+    {
+        var map = new Dictionary<string, Dictionary<string, long[]>>(StringComparer.Ordinal);
+        if (ledger is not null)
+        {
+            foreach (var (day, byModel) in ledger.Days)
+            {
+                var m = new Dictionary<string, long[]>(StringComparer.OrdinalIgnoreCase);
+                foreach (var (model, c) in byModel) m[model] = c.ToArray();
+                map[day] = m;
+            }
+        }
+        ServerDays = map;
+    }
+
+    public UsageLedger LoadLedger()
+    {
+        var l = new UsageLedger { RootDescription = "云端接口（已持久化）" };
+        if (ServerDays is null) return l;
+        foreach (var (day, byModel) in ServerDays)
+        {
+            foreach (var (model, arr) in byModel) l.Add(day, model, Counters.FromArray(arr));
+        }
+        return l;
+    }
+
+    public bool HasPersistedLedger => ServerDays is { Count: > 0 };
+
     public string ToJson() => JsonSerializer.Serialize(this, JsonOpts);
 
     public static ProviderState Parse(string? json)

@@ -61,6 +61,8 @@ public sealed class TokenMeterPlugin : IslandPluginBase
         _scanner = new UsageScanner(cacheDir);
         _providerState = LoadProviderState();
         _coveredUntilUtc = _providerState.CoveredUntilUtc;
+        // 云端账本要和水位线一起恢复，否则重启后水位线会遮住已经拉过的数据
+        if (_providerState.HasPersistedLedger) _serverLedger = _providerState.LoadLedger();
 
         _view = new TokenMeterView(Manifest, Theme);
         _view.SetScanning(true);
@@ -373,6 +375,7 @@ public sealed class TokenMeterPlugin : IslandPluginBase
             : (_coveredUntilUtc ?? nowUtc.AddMinutes(-cfg.LagMinutes));
 
         _serverLedger = merged;
+        _providerState.SaveLedger(merged);
         _coveredUntilUtc = advanced;
         _providerState.CoveredUntilUtc = advanced;
         _providerState.LastSuccessUtc = nowUtc;
@@ -971,7 +974,13 @@ public sealed class TokenMeterPlugin : IslandPluginBase
             CommitPer(perBox);
             lock (_ledgerLock) { _lastLedger = null; }
             _scanner.ForgetCache();
-            Status("已清空缓存，正在从头重扫全部文件…（第一次会慢）");
+            // 「完整重扫」必须连云端水位线一起清：否则水位线会遮住本该重拉的那段，
+            // 而“完整”两个字就是假的
+            _serverLedger = null;
+            _coveredUntilUtc = null;
+            _providerState = new ProviderState();
+            SaveProviderState();
+            Status("已清空缓存（含云端水位线），正在从头重扫…（第一次会慢）");
             _ = RefreshAsync("手动完整重扫");
         };
 
