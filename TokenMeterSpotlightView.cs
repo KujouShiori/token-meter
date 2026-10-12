@@ -171,6 +171,11 @@ public sealed class TokenMeterSpotlightView : UserControl
     private void RebuildKpis(Snapshot s)
     {
         _kpiHost.Children.Clear();
+        // 两栏 KPI 必须上下对齐。WinUI 3 没有 WPF 的 SharedSizeGroup，
+        // 所以改用固定权重比的星型列：两行用同一套列定义，天然对齐。
+        // 权重给「今日」多留位（它下面还有一行 token · 请求数）。
+        var kpiWeights = new double[] { 1.45, 1.15, 1.15, 1.15, 1.0 };
+
         var blocks = s.Blocks.Count > 0 ? s.Blocks : new List<SourceBlock>();
 
         foreach (var b in blocks)
@@ -189,35 +194,51 @@ public sealed class TokenMeterSpotlightView : UserControl
                 ? "—"
                 : (b.Today.CostBasis == "本地估算" && priced <= 0 ? "未定价" : Format.Money(b.Currency, b.Today.Cost));
 
-            var row = new StackPanel { Orientation = Orientation.Horizontal, Spacing = S(26) };
-            row.Children.Add(Kpi(todayCost, "今日",
-                $"{Format.Tokens(b.Today.C.Total)} tok · {b.Today.C.Requests} 次请求", out _));
-            row.Children.Add(Kpi(b.HasData ? Format.Money(b.Currency, b.Week.Cost) : "—", "本周", null, out _));
-            row.Children.Add(Kpi(b.HasData ? Format.Money(b.Currency, b.Month.Cost) : "—", "本月", null, out _));
-            row.Children.Add(Kpi(b.HasData ? Format.Money(b.Currency, b.All.Cost) : "—", "累计",
-                $"{b.LedgerDays} 天", out _));
-            row.Children.Add(Kpi($"{Format.Percent(b.Today.C.CacheHitRate)}", "今日缓存命中", null, out _));
+            var cells = new[]
+            {
+                Kpi(todayCost, "今日", $"{Format.Tokens(b.Today.C.Total)} tok · {b.Today.C.Requests} 次请求"),
+                Kpi(b.HasData ? Format.Money(b.Currency, b.Week.Cost) : "—", "本周", null),
+                Kpi(b.HasData ? Format.Money(b.Currency, b.Month.Cost) : "—", "本月", null),
+                Kpi(b.HasData ? Format.Money(b.Currency, b.All.Cost) : "—", "累计", $"{b.LedgerDays} 天"),
+                Kpi(b.HasData ? $"{Format.Percent(b.Today.C.CacheHitRate)}" : "—", "今日缓存命中", null),
+            };
 
-            wrap.Children.Add(row);
+            var grid = new Grid { ColumnSpacing = S(16) };
+            for (var i = 0; i < cells.Length; i++)
+            {
+                grid.ColumnDefinitions.Add(new ColumnDefinition
+                {
+                    Width = new GridLength(kpiWeights[i], GridUnitType.Star),
+                });
+                Grid.SetColumn(cells[i], i);
+                grid.Children.Add(cells[i]);
+            }
+
+            wrap.Children.Add(grid);
             _kpiHost.Children.Add(wrap);
         }
     }
 
-    private StackPanel Kpi(string value, string label, string? sub, out TextBlock valueBox)
+    private StackPanel Kpi(string value, string label, string? sub)
     {
         var stack = new StackPanel { Spacing = S(2) };
-        valueBox = new TextBlock
+        stack.Children.Add(new TextBlock
         {
             Text = value,
             FontSize = T(22),
             FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
             Foreground = _textBrush,
-        };
-        stack.Children.Add(valueBox);
+        });
         stack.Children.Add(new TextBlock { Text = label, FontSize = T(11), Foreground = _mutedBrush });
         if (!string.IsNullOrEmpty(sub))
         {
-            stack.Children.Add(new TextBlock { Text = sub, FontSize = T(11), Foreground = _faintBrush });
+            stack.Children.Add(new TextBlock
+            {
+                Text = sub,
+                FontSize = T(11),
+                Foreground = _faintBrush,
+                TextWrapping = TextWrapping.Wrap,
+            });
         }
         return stack;
     }
@@ -250,15 +271,28 @@ public sealed class TokenMeterSpotlightView : UserControl
 
             var col = new StackPanel { Spacing = S(3), Width = colWidth * Math.Max(1, blocks.Count) };
 
-            // 金额标签：第一行本地、第二行云端（按来源顺序各一行）
+            // 金额标签：按来源顺序各一行（第一行本地、第二行云端）
             for (var b = 0; b < blocks.Count; b++)
             {
                 var p = i < blocks[b].Last7.Count ? blocks[b].Last7[i] : null;
-                var text = p is null
-                    ? "—"
-                    : (p.ServerCost > 0
-                        ? Format.Money(blocks[b].Currency, p.ServerCost)
-                        : (p.HasUnpriced && p.Cost <= 0 ? "—" : Format.Money(blocks[b].Currency, p.Cost)));
+                // 那天该源根本没有用量时给「—」，不能给 $0：那会被读成「花了 0 元」
+                string text;
+                if (p is null || p.Total <= 0)
+                {
+                    text = "—";
+                }
+                else if (p.ServerCost > 0)
+                {
+                    text = Format.Money(blocks[b].Currency, p.ServerCost);
+                }
+                else if (p.Cost <= 0 && p.HasUnpriced)
+                {
+                    text = "未定价";
+                }
+                else
+                {
+                    text = Format.Money(blocks[b].Currency, p.Cost);
+                }
 
                 col.Children.Add(new TextBlock
                 {
