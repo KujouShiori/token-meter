@@ -198,13 +198,10 @@ public sealed class TokenMeterPlugin : IslandPluginBase
                         _coveredUntilUtc = null;
                     }
 
-                    // 先把本地结果立即上屏：接口慢、卡住或在翻页时，界面也不会空着等你
-                    var interim = SnapshotBuilder.Build(local, pricing);
-                    interim.RootDescription = local.RootDescription;
-                    interim.Files = local.Files;
-                    interim.ScannedBytes = local.ScannedBytes;
-                    interim.SourceMode = cfg.Enabled ? "本地日志（接口拉取中）" : "本地日志";
-                    RunOnUI(() => Apply(interim));
+                    // 先把本地结果立即上屏：接口慢、卡住或在翻页时，界面也不会空着等你。
+                    // 这里必须走多来源合成：否则这一帧只有本地一块，
+                    // 双柱图与云端 KPI 栏会在每次刷新中途闪没一下（已发生过）。
+                    RunOnUI(() => Apply(ComposeSnapshot(local, pricing, cfg, "云端拉取中…")));
 
                     var note = string.Empty;
                     if (cfg.Enabled)
