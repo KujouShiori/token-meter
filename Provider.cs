@@ -119,6 +119,10 @@ public sealed class ProviderConfig
     public int LagMinutes { get; set; } = 120;
 
     public int TimeoutSeconds { get; set; } = 15;
+
+    /// <summary>一轮里接口阶段最多花多少秒。超过就停手、本轮先用本地日志，
+    /// 避免接口卡住时把后面的手动刷新全排在队里等。</summary>
+    public int ProviderBudgetSeconds { get; set; } = 45;
     public int MaxPagesPerWindow { get; set; } = 50;
     /// <summary>一轮最多拉多少个窗口，防止首次同步把 UI 卡住。</summary>
     public int MaxWindowsPerRun { get; set; } = 12;
@@ -147,6 +151,7 @@ public sealed class ProviderConfig
             cfg.WindowMaxDays = Math.Clamp(cfg.WindowMaxDays, 1, 366);
             cfg.LagMinutes = Math.Clamp(cfg.LagMinutes, 0, 2880);
             cfg.TimeoutSeconds = Math.Clamp(cfg.TimeoutSeconds, 2, 120);
+            cfg.ProviderBudgetSeconds = Math.Clamp(cfg.ProviderBudgetSeconds, 5, 300);
             cfg.MaxPagesPerWindow = Math.Clamp(cfg.MaxPagesPerWindow, 1, 500);
             cfg.MaxWindowsPerRun = Math.Clamp(cfg.MaxWindowsPerRun, 1, 200);
             cfg.InitialBackfillDays = Math.Clamp(cfg.InitialBackfillDays, 1, 366);

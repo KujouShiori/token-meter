@@ -40,6 +40,11 @@ public sealed class TokenMeterPlugin : IslandPluginBase
     /// <summary>把最新结果回推给还开着的设置页。</summary>
     public event Action<Snapshot?>? SnapshotApplied;
 
+    /// <summary>后台是否在拉取中，用来给设置页按钮做即时反馈。</summary>
+    public event Action<bool>? BusyChanged;
+
+    private string _lastProviderNote = string.Empty;
+
     protected override Task OnInitializeAsync()
     {
         Log.Info($"启动：{Manifest.Id} {Manifest.Version}（宿主 {HostVersion}），插件目录 {PluginDirectory}");
@@ -158,6 +163,7 @@ public sealed class TokenMeterPlugin : IslandPluginBase
         }
 
         _busy = true;
+        RaiseBusy(true);
         RunOnUI(() => _view.SetScanning(true));
 
         try
@@ -188,6 +194,14 @@ public sealed class TokenMeterPlugin : IslandPluginBase
                         _serverLedger = null;
                         _coveredUntilUtc = null;
                     }
+
+                    // 先把本地结果立即上屏：接口慢、卡住或在翻页时，界面也不会空着等你
+                    var interim = SnapshotBuilder.Build(local, pricing);
+                    interim.RootDescription = local.RootDescription;
+                    interim.Files = local.Files;
+                    interim.ScannedBytes = local.ScannedBytes;
+                    interim.SourceMode = cfg.Enabled ? "本地日志（接口拉取中）" : "本地日志";
+                    RunOnUI(() => Apply(interim));
 
                     var note = string.Empty;
                     if (cfg.Enabled)
@@ -256,7 +270,24 @@ public sealed class TokenMeterPlugin : IslandPluginBase
         finally
         {
             _busy = false;
+            RaiseBusy(false);
             _gate.Release();
+        }
+    }
+
+    private void RaiseBusy(bool busy)
+    {
+        try
+        {
+            Context.RunOnUI(() =>
+            {
+                try { BusyChanged?.Invoke(busy); }
+                catch (Exception ex) { Log.Warn($"按钮状态回推失败（已忽略）：{ex.Message}"); }
+            });
+        }
+        catch (Exception)
+        {
+            // 插件正在停用时调度失败是正常的，忽略
         }
     }
 
@@ -278,9 +309,16 @@ public sealed class TokenMeterPlugin : IslandPluginBase
         long bytes = 0;
 
         using var client = new ProviderClient(cfg.TimeoutSeconds);
+        var deadline = nowUtc.AddSeconds(cfg.ProviderBudgetSeconds);
+        var hitBudget = false;
         foreach (var (from, to) in plan)
         {
             ct.ThrowIfCancellationRequested();
+            if (DateTime.UtcNow > deadline)
+            {
+                hitBudget = true;
+                break;
+            }
 
             var r = await client.FetchAsync(cfg, from, to, ct).ConfigureAwait(false);
             merged.MergeOverwrite(r.Ledger);
@@ -290,7 +328,7 @@ public sealed class TokenMeterPlugin : IslandPluginBase
         }
 
         var advanced = plan.Count > 0
-            ? plan[^1].To
+            ? (hitBudget ? plan[Math.Max(0, windows - 1)].To : plan[^1].To)
             : (_coveredUntilUtc ?? nowUtc.AddMinutes(-cfg.LagMinutes));
 
         _serverLedger = merged;
@@ -302,8 +340,16 @@ public sealed class TokenMeterPlugin : IslandPluginBase
         _providerState.ServerTotalTokens = merged.TotalTokens();
         SaveProviderState();
 
-        Log.Info($"服务端用量拉取完成：{windows} 段 / {pages} 页 / {Format.Bytes(bytes)}，"
-               + $"水位线推到 {advanced:yyyy-MM-dd HH:mm}Z，累计 {Format.Tokens(_providerState.ServerTotalTokens)} token");
+        // 上一轮失败、本轮成功：补一条恢复日志（失败那边的重复告警已做去重）
+        if (!string.IsNullOrEmpty(_lastProviderNote))
+        {
+            Log.Info("接口已恢复，上一轮问题：" + _lastProviderNote);
+            _lastProviderNote = string.Empty;
+        }
+
+        Log.Info($"服务端用量拉取完成：{windows} 段 / {pages} 页 / {Format.Bytes(bytes)}"
+               + (hitBudget ? $"（本轮接口预算 {cfg.ProviderBudgetSeconds}s 用完，剩余窗口下轮继续）" : string.Empty)
+               + $"，水位线推到 {advanced:yyyy-MM-dd HH:mm}Z，累计 {Format.Tokens(_providerState.ServerTotalTokens)} token");
     }
 
     private void RememberProviderFailure(string note)
@@ -311,6 +357,10 @@ public sealed class TokenMeterPlugin : IslandPluginBase
         _providerState.LastAttemptUtc = DateTime.UtcNow;
         _providerState.LastError = note;
         SaveProviderState();
+
+        // 同一个原因每分钟刷一条 WARN 会把日志埋掉（实测 121 条）：只在原因变化时记
+        if (string.Equals(note, _lastProviderNote, StringComparison.Ordinal)) return;
+        _lastProviderNote = note;
         Log.Warn(note + "（保留上一次服务端数据，并继续用本地日志兜底）");
     }
 
@@ -887,6 +937,18 @@ public sealed class TokenMeterPlugin : IslandPluginBase
         page.Children.Add(buttons);
         page.Children.Add(statusText);
 
+        // 把后台忙碌状态接回按钮：以前只改了一行小字（在页面底部容易被忽略），
+        // 点了以后看起来「没反应」
+        Action<bool> onBusy = busy =>
+        {
+            refreshButton.IsEnabled = !busy;
+            rescanButton.IsEnabled = !busy;
+            refreshButton.Content = busy ? "刷新中…" : "立即刷新";
+            rescanButton.Content = busy ? "重扫中…" : "清空缓存并完整重扫";
+        };
+        BusyChanged += onBusy;
+        page.Unloaded += (_, _) => BusyChanged -= onBusy;
+
         RebuildPriceList(priceList, emptyHint, statusText);
         if (_lastSnapshot is not null) statusText.Text = StatusLine(_lastSnapshot);
 
@@ -956,15 +1018,12 @@ public sealed class TokenMeterPlugin : IslandPluginBase
         var cacheRead = new TextBox { Header = "缓存读", Text = Num(price.CacheRead), Width = 110 };
         var cacheWrite = new TextBox { Header = "缓存写", Text = Num(price.CacheWrite), Width = 110 };
 
-        var editors = new StackPanel { Spacing = 6, Margin = new Thickness(0, 6, 0, 0) };
-        var editorRow1 = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 10 };
-        editorRow1.Children.Add(input);
-        editorRow1.Children.Add(output);
-        var editorRow2 = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 10 };
-        editorRow2.Children.Add(cacheRead);
-        editorRow2.Children.Add(cacheWrite);
-        editors.Children.Add(editorRow1);
-        editors.Children.Add(editorRow2);
+        // 四个价格框回到一行（框宽不变，仍为 110）
+        var editors = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 10, Margin = new Thickness(0, 6, 0, 0) };
+        editors.Children.Add(input);
+        editors.Children.Add(output);
+        editors.Children.Add(cacheRead);
+        editors.Children.Add(cacheWrite);
 
         var box = new StackPanel { Spacing = 4 };
         box.Children.Add(titleRow);
