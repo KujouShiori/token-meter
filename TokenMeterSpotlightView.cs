@@ -39,7 +39,7 @@ public sealed class TokenMeterSpotlightView : UserControl
     private static double T(double v) => v * TextScale;
     private static double D(double v) => v * DataTextScale;
 
-    private const double BarAreaHeight = 112 * DataTextScale;
+    private const double BarAreaHeight = 123.2 * DataTextScale;   // 112 × 1.1：柱体加高 10%
 
     /// <summary>除首列（星型，模型名）外六列的基准宽：请求/输入/输出/缓存读/合计/费用。</summary>
     private static readonly double[] TableColWidths = { 36, 44, 50, 56, 56, 74 };
@@ -100,7 +100,7 @@ public sealed class TokenMeterSpotlightView : UserControl
         };
         _table = new StackPanel { Spacing = S(2) };
 
-        var chartLabel = new TextBlock { Text = "近 7 天用量（柱高 = token 数，金额见每柱上方）", FontSize = D(13), Foreground = _mutedBrush };
+        var chartLabel = new TextBlock { Text = "近 7 天用量", FontSize = D(13), Foreground = _mutedBrush };
         var tableLabel = new TextBlock { Text = "今日逐模型明细", FontSize = D(13), Foreground = _mutedBrush };
 
         var root = new StackPanel
@@ -304,6 +304,22 @@ public sealed class TokenMeterSpotlightView : UserControl
                     TextWrapping = TextWrapping.NoWrap,
                 });
             }
+
+            // 金额下面再给一行当天总 token：token 是跨币种可比的量，两个运营商相加有意义
+            long dayTokens = 0;
+            for (var b = 0; b < blocks.Count; b++)
+                if (i < blocks[b].Last7.Count) dayTokens += blocks[b].Last7[i].Total;
+
+            col.Children.Add(new TextBlock
+            {
+                Text = dayTokens > 0 ? Format.Tokens(dayTokens) + " tok" : "—",
+                FontSize = D(9),
+                Foreground = _faintBrush,
+                TextAlignment = TextAlignment.Center,
+                HorizontalAlignment = HorizontalAlignment.Center,
+                TextWrapping = TextWrapping.NoWrap,
+                Margin = new Thickness(0, 0, 0, S(2)),
+            });
 
             var barRow = new StackPanel
             {

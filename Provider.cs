@@ -387,6 +387,7 @@ public sealed class ProviderState
         return l;
     }
 
+    [System.Text.Json.Serialization.JsonIgnore]
     public bool HasPersistedLedger => ServerDays is { Count: > 0 };
 
     public string ToJson() => JsonSerializer.Serialize(this, JsonOpts);
