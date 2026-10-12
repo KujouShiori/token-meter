@@ -104,6 +104,12 @@ public sealed class ProviderConfig
     /// <summary>思考 token 字段。仅在 InputIncludesCached/独立计费的口径下才需要动。</summary>
     public string ReasoningField { get; set; } = "";
 
+    /// <summary>这个接口上报的模型归它管（逗号分隔，* = 全部）；留空视为「上报什么就归什么」。</summary>
+    public string ModelScope { get; set; } = "";
+
+    /// <summary>云端金额的币种（New API 这类网关通常是美元），与本地 ¥ 不能相加。</summary>
+    public string Currency { get; set; } = "$";
+
     /// <summary>每页最多要多少个时间桶；部分接口靠这个参数限制返回量。留空则不传。</summary>
     public string LimitParam { get; set; } = "";
 

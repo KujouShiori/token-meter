@@ -120,6 +120,8 @@ public sealed class DayPoint
     public DateOnly Day { get; set; }
     public long Total { get; set; }
     public decimal Cost { get; set; }
+    /// <summary>服务端报回的真实金额（有就不走本地估算）。</summary>
+    public decimal ServerCost { get; set; }
     public bool HasUnpriced { get; set; }
 }
 
@@ -156,6 +158,12 @@ public sealed class Snapshot
     public int LedgerDays { get; set; }
     public string? Note { get; set; }
     public string? Error { get; set; }
+
+    /// <summary>分列展示用的各来源块（本地 / 云端）。顶层字段是「主来源」的快引用。</summary>
+    public List<SourceBlock> Blocks { get; set; } = new();
+
+    /// <summary>归属分派说明，例如哪些模型已被云端接管。</summary>
+    public string SplitNote { get; set; } = "";
 }
 
 /// <summary>按「本地日期 -> 模型 -> 计数」组织的账本。</summary>
@@ -269,16 +277,15 @@ internal sealed class Bucket
 /// <summary>把账本 + 单价配置算成视图能直接画的快照。</summary>
 public static class SnapshotBuilder
 {
-    public static Snapshot Build(UsageLedger ledger, PricingConfig pricing)
+    /// <summary>把一个账本算成「一个来源」的一块展示数据。两个运营商就调两次，各用各的币种。</summary>
+    public static SourceBlock BuildBlock(UsageLedger ledger, PricingConfig pricing, string name)
     {
-        var snap = new Snapshot
+        var b = new SourceBlock
         {
+            Name = name,
             Currency = pricing.Currency,
-            RootDescription = ledger.RootDescription,
-            Files = ledger.Files,
-            ScannedBytes = ledger.ScannedBytes,
             LedgerDays = ledger.Days.Count,
-            Note = ledger.Note,
+            Note = ledger.Note ?? "",
         };
 
         var today = DateOnly.FromDateTime(DateTime.Now);
@@ -313,22 +320,22 @@ public static class SnapshotBuilder
         monthB.Finish();
         allB.Finish();
 
-        snap.Today = todayB.Agg;
-        snap.Week = weekB.Agg;
-        snap.Month = monthB.Agg;
-        snap.All = allB.Agg;
+        b.Today = todayB.Agg;
+        b.Week = weekB.Agg;
+        b.Month = monthB.Agg;
+        b.All = allB.Agg;
 
-        ApplyCostBasis(snap.Today);
-        ApplyCostBasis(snap.Week);
-        ApplyCostBasis(snap.Month);
-        ApplyCostBasis(snap.All);
+        ApplyCostBasis(b.Today);
+        ApplyCostBasis(b.Week);
+        ApplyCostBasis(b.Month);
+        ApplyCostBasis(b.All);
 
-        snap.TodayByModel = todayB.ByModel.Values
+        b.TodayByModel = todayB.ByModel.Values
             .OrderByDescending(m => m.Cost)
             .ThenByDescending(m => m.C.Total)
             .ToList();
 
-        snap.UnpricedNames = allB.ByModel.Values
+        b.UnpricedNames = allB.ByModel.Values
             .Where(m => !m.Priced)
             .Select(m => m.Model)
             .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
@@ -346,14 +353,48 @@ public static class SnapshotBuilder
                     point.Total += c.Total;
                     var priced = pricing.TryCost(model, c, out var cost);
                     point.Cost += cost;
-                    if (!priced) point.HasUnpriced = true;
+                    if (c.FromServer && c.Cost > 0) point.ServerCost = (decimal)c.Cost;
+                    if (!priced && !(c.FromServer && c.Cost > 0)) point.HasUnpriced = true;
                 }
             }
-            snap.Last7.Add(point);
+            b.Last7.Add(point);
         }
 
-        snap.HasData = snap.All.C.Total > 0 || snap.All.C.Requests > 0;
+        b.HasData = b.All.C.Total > 0 || b.All.C.Requests > 0;
+        return b;
+    }
+
+    /// <summary>单来源快照（兼容旧调用）：块的内容同时拷到快照顶层。</summary>
+    public static Snapshot Build(UsageLedger ledger, PricingConfig pricing)
+        => Build(ledger, pricing, "本地日志");
+
+    public static Snapshot Build(UsageLedger ledger, PricingConfig pricing, string name)
+    {
+        var b = BuildBlock(ledger, pricing, name);
+        var snap = new Snapshot
+        {
+            Currency = b.Currency,
+            RootDescription = ledger.RootDescription,
+            Files = ledger.Files,
+            ScannedBytes = ledger.ScannedBytes,
+        };
+        CopyBlock(snap, b);
+        snap.Blocks.Add(b);
         return snap;
+    }
+
+    /// <summary>把主块填进快照顶层，让岛面等只读顶层字段的代码不用改。</summary>
+    public static void CopyBlock(Snapshot snap, SourceBlock b)
+    {
+        snap.Today = b.Today;
+        snap.Week = b.Week;
+        snap.Month = b.Month;
+        snap.All = b.All;
+        snap.TodayByModel = b.TodayByModel;
+        snap.Last7 = b.Last7;
+        snap.UnpricedNames = b.UnpricedNames;
+        snap.HasData = b.HasData;
+        snap.LedgerDays = b.LedgerDays;
     }
 
     /// <summary>

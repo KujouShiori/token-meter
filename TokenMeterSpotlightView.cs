@@ -43,6 +43,7 @@ public sealed class TokenMeterSpotlightView : UserControl
     private readonly TextBlock _kpiHit;
     private readonly StackPanel _bars;
     private readonly StackPanel _table;
+    private readonly StackPanel _extra;
     private readonly TextBlock _source;
     private readonly Button _refresh;
 
@@ -110,6 +111,8 @@ public sealed class TokenMeterSpotlightView : UserControl
 
         var chartLabel = new TextBlock { Text = "近 7 天用量", FontSize = D(13), Foreground = _mutedBrush };
         _table = new StackPanel { Spacing = S(2) };
+        // 第二个及以后的来源分列在这里：不同运营商、不同币种，绝不合并相加
+        _extra = new StackPanel { Spacing = S(10) };
         var tableLabel = new TextBlock { Text = "今日逐模型明细", FontSize = D(13), Foreground = _mutedBrush };
 
         _source = new TextBlock { FontSize = T(11), Foreground = _faintBrush, TextWrapping = TextWrapping.Wrap };
@@ -131,6 +134,7 @@ public sealed class TokenMeterSpotlightView : UserControl
         root.Children.Add(Divider());
         root.Children.Add(tableLabel);
         root.Children.Add(_table);
+        root.Children.Add(_extra);
 
         Content = new ScrollViewer
         {
@@ -202,9 +206,13 @@ public sealed class TokenMeterSpotlightView : UserControl
         var todayPriced = s.Today.Models - s.Today.UnpricedModels;
 
         // 口径变了必须看得出来：接口挂了在后台静默降级比报错更难发现
-        _source.Text = s.SourceMode + $" ｜ 费用口径：{s.Today.CostBasis}" + (s.CoveredUntilUtc is null
+        _source.Text = (s.Blocks.Count > 1
+                ? string.Join(" ＋ ", s.Blocks.Select(x => x.Name))
+                : s.SourceMode)
+            + $" ｜ 主块费用口径：{s.Today.CostBasis}" + (s.CoveredUntilUtc is null
             ? string.Empty
-            : $"（服务端覆盖到 {Format.Ago(s.CoveredUntilUtc.Value)}）")
+            : $"（云端覆盖到 {Format.Ago(s.CoveredUntilUtc.Value)}）")
+            + (string.IsNullOrEmpty(s.SplitNote) ? string.Empty : " · " + s.SplitNote)
             + (string.IsNullOrEmpty(s.ProviderNote) ? string.Empty : " · " + s.ProviderNote);
 
         _kpiTodayCost.Text = s.HasData
@@ -218,6 +226,55 @@ public sealed class TokenMeterSpotlightView : UserControl
 
         RebuildBars(s, cur);
         RebuildTable(s, cur);
+        RebuildExtraBlocks(s);
+    }
+
+    /// <summary>把除主来源以外的每个源单独成块展示，各自带币种与口径。</summary>
+    private void RebuildExtraBlocks(Snapshot s)
+    {
+        _extra.Children.Clear();
+        if (s.Blocks.Count <= 1) return;
+
+        for (var i = 1; i < s.Blocks.Count; i++)
+        {
+            var b = s.Blocks[i];
+            _extra.Children.Add(Divider());
+
+            var priced = b.Today.Models - b.Today.UnpricedModels;
+            var todayCost = !b.HasData
+                ? "—"
+                : (b.Today.CostBasis == "本地估算" && priced <= 0 ? "未定价" : Format.Money(b.Currency, b.Today.Cost));
+
+            _extra.Children.Add(new TextBlock
+            {
+                Text = b.Name,
+                FontSize = D(13),
+                FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
+                Foreground = _textBrush,
+            });
+            _extra.Children.Add(new TextBlock
+            {
+                Text = $"今日 {todayCost} · {Format.Tokens(b.Today.C.Total)} tok ｜ 本周 {Format.Money(b.Currency, b.Week.Cost)} ｜ 本月 {Format.Money(b.Currency, b.Month.Cost)} ｜ 累计 {Format.Money(b.Currency, b.All.Cost)} ｜ 费用口径：{b.Today.CostBasis} ｜ 共 {b.LedgerDays} 天",
+                FontSize = D(11.5),
+                TextWrapping = TextWrapping.Wrap,
+                Foreground = _mutedBrush,
+            });
+
+            foreach (var m in b.TodayByModel.Take(6))
+            {
+                var serverCost = m.C.FromServer && m.C.Cost > 0;
+                _extra.Children.Add(TableRow(
+                    m.Model,
+                    m.C.Requests.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                    Format.Tokens(m.C.Input),
+                    Format.Tokens(m.C.Output),
+                    Format.Tokens(m.C.CacheRead),
+                    Format.Tokens(m.C.Total),
+                    serverCost ? Format.Money(b.Currency, (decimal)m.C.Cost)
+                        : (m.Priced ? Format.Money(b.Currency, m.Cost) : "未定价"),
+                    header: false));
+            }
+        }
     }
 
     private void RebuildBars(Snapshot s, string cur)

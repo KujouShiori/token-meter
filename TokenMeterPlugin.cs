@@ -74,6 +74,7 @@ public sealed class TokenMeterPlugin : IslandPluginBase
         Context.Register(Context.OnSettingsChanged("priority", OnPriorityChanged));
         Context.Register(Context.OnSettingsChanged("pricing", OnPricingChanged));
         Context.Register(Context.OnSettingsChanged("roots", () => _ = RefreshAsync("数据目录变更")));
+        Context.Register(Context.OnSettingsChanged("localScope", () => RecomputeFromLedger("模型归属变更")));
         Context.Register(Context.OnSettingsChanged("provider", OnProviderConfigChanged));
         Context.Register(Context.OnSettingsChanged("refreshSeconds", () => { _secondsSinceRefresh = 0; }));
 
@@ -231,20 +232,8 @@ public sealed class TokenMeterPlugin : IslandPluginBase
                         }
                     }
 
-                    var (effective, info) = LedgerMerger.Merge(
-                        local, _serverLedger, _coveredUntilUtc, cfg.UndercountWarnPercent);
-
-                    var s = SnapshotBuilder.Build(effective, pricing);
-                    s.RootDescription = local.RootDescription;
-                    s.Files = local.Files;
-                    s.ScannedBytes = local.ScannedBytes;
-                    s.SourceMode = info.Mode;
-                    s.ProviderSummary = cfg.Enabled ? cfg.SafeSummary() : "服务端接口未启用";
-                    s.CoveredUntilUtc = info.CoveredUntilUtc;
-                    s.ServerUndercount = info.Undercount;
-                    s.ProviderNote = info.Undercount ? info.UndercountDetail : note;
-
-                    lock (_ledgerLock) { _lastLedger = effective; }
+                    var s = ComposeSnapshot(local, pricing, cfg, note);
+                    lock (_ledgerLock) { _lastLedger = local; }
                     return s;
                 }, token).ConfigureAwait(false);
             }
@@ -289,6 +278,58 @@ public sealed class TokenMeterPlugin : IslandPluginBase
         {
             // 插件正在停用时调度失败是正常的，忽略
         }
+    }
+
+    /// <summary>
+    /// 把本地账本与云端账本算成【分列的两块】。两个运营商的用量不相交、币种也不同，
+    /// 所以绝不合并相加；只有被云端声明的模型才从本地剔出去（避免同一模型算两遍）。
+    /// </summary>
+    private Snapshot ComposeSnapshot(UsageLedger local, PricingConfig pricing, ProviderConfig cfg, string note)
+    {
+        var blocks = new List<SourceBlock>();
+        var splitNote = string.Empty;
+        var haveServer = cfg.Enabled && _serverLedger is not null && _serverLedger.Days.Count > 0;
+
+        SourceBlock primary;
+        if (haveServer)
+        {
+            var (localPart, serverPart, split) = LedgerSplitter.Split(
+                local, _serverLedger!,
+                ModelScope.Parse(Settings.Get("localScope", string.Empty)),
+                ModelScope.Parse(cfg.ModelScope));
+
+            // 云端用自己的币种；没拿到 quota 的模型仍回退到本地单价估算
+            var serverPricing = PricingConfig.Parse(pricing.ToJson());
+            serverPricing.Currency = string.IsNullOrWhiteSpace(cfg.Currency) ? "$" : cfg.Currency.Trim();
+
+            var lb = SnapshotBuilder.BuildBlock(localPart, pricing, "本地日志");
+            var sb = SnapshotBuilder.BuildBlock(serverPart, serverPricing, cfg.DisplayName);
+            blocks.Add(lb);
+            blocks.Add(sb);
+            splitNote = split.Note;
+            primary = lb.HasData ? lb : sb;
+        }
+        else
+        {
+            primary = SnapshotBuilder.BuildBlock(local, pricing, "本地日志");
+            blocks.Add(primary);
+        }
+
+        var snap = new Snapshot
+        {
+            Currency = primary.Currency,
+            RootDescription = local.RootDescription,
+            Files = local.Files,
+            ScannedBytes = local.ScannedBytes,
+            Blocks = blocks,
+            SplitNote = splitNote,
+            SourceMode = haveServer ? "本地 + 云端（分列）" : "本地日志",
+            ProviderSummary = cfg.Enabled ? cfg.SafeSummary() : "服务端接口未启用",
+            CoveredUntilUtc = haveServer ? _coveredUntilUtc : null,
+            ProviderNote = note,
+        };
+        SnapshotBuilder.CopyBlock(snap, primary);
+        return snap;
     }
 
     private readonly object _ledgerLock = new();
@@ -409,14 +450,19 @@ public sealed class TokenMeterPlugin : IslandPluginBase
     private void RecomputeFromLedger(string reason)
     {
         var pricing = PricingConfig.Parse(Settings.Get("pricing", string.Empty));
-        Snapshot snap;
-        lock (_ledgerLock)
+        var cfg = ProviderConfig.Parse(Settings.Get("provider", string.Empty));
+        UsageLedger? local;
+        lock (_ledgerLock) { local = _lastLedger; }
+
+        if (local is null)
         {
-            snap = _lastLedger is null
-                ? new Snapshot { Currency = pricing.Currency, Error = "还没有扫描结果" }
-                : SnapshotBuilder.Build(_lastLedger, pricing);
+            RunOnUI(() => Apply(new Snapshot { Currency = pricing.Currency, Error = "还没有扫描结果" }));
+            return;
         }
-        Log.Info($"重算快照（{reason}）：今日 {Format.Amount(snap.Today.Cost)}{snap.Currency}");
+
+        var snap = ComposeSnapshot(local, pricing, cfg, string.Empty);
+        if (snap.ServerUndercount) snap.ProviderNote = snap.SplitNote;
+        Log.Info($"重算快照（{reason}）：今日 {Format.Amount(snap.Today.Cost)}{snap.Currency}，{snap.Blocks.Count} 个来源");
         RunOnUI(() => Apply(snap));
     }
 
@@ -610,6 +656,22 @@ public sealed class TokenMeterPlugin : IslandPluginBase
         };
         page.Children.Add(Card(rootsBox));
 
+        // ---- 本地日得的模型归属（手动填）----
+        var localScopeBox = new TextBox
+        {
+            Header = "本地日志统计哪些模型（逗号分隔，留空 = 除云端认领外的全部）",
+            Text = Settings.Get("localScope", string.Empty),
+            PlaceholderText = "例如 SCNet-Max, GLM-",
+            MinWidth = 460,
+            HorizontalAlignment = HorizontalAlignment.Left,
+        };
+        localScopeBox.LostFocus += (_, _) => CommitLocalScope(localScopeBox);
+        localScopeBox.KeyDown += (_, e) =>
+        {
+            if (e.Key == Windows.System.VirtualKey.Enter) CommitLocalScope(localScopeBox);
+        };
+        page.Children.Add(Card(localScopeBox));
+
         // ---- 货币符号 + 单价基数 ----
         var currencyBox = new TextBox
         {
@@ -658,6 +720,14 @@ public sealed class TokenMeterPlugin : IslandPluginBase
         var provToggle = new ToggleSwitch { Header = "启用服务端接口", IsOn = prov.Enabled };
         provToggle.Toggled += (_, _) => SetProvider(c => c.Enabled = provToggle.IsOn);
         page.Children.Add(Card(provToggle));
+
+        // 云端只算它自己报上来的模型；两边重叠时以云端为准并从本地剔掉，避免算两遍
+        var provScopeBox = MakeLine("云端统计哪些模型（逗号分隔，留空 = 上报什么就归什么）", prov.ModelScope, "例如 deepseek-, claude-", 460);
+        var provCurrencyBox = MakeLine("云端币种", prov.Currency, "$", 120);
+        CommitOnEnter(provScopeBox, () => SetProvider(c => c.ModelScope = (provScopeBox.Text ?? string.Empty).Trim()));
+        CommitOnEnter(provCurrencyBox, () => SetProvider(c => c.Currency = (provCurrencyBox.Text ?? string.Empty).Trim()));
+        page.Children.Add(Card(provScopeBox));
+        page.Children.Add(Card(provCurrencyBox));
 
         var baseUrlBox = MakeLine("接口根地址 BaseUrl", prov.BaseUrl, "https://api.example.com/v1", 460);
         var pathBox = MakeLine("用量查询路径 Path", prov.Path, "/organization/usage/completions", 460);
@@ -1120,6 +1190,13 @@ public sealed class TokenMeterPlugin : IslandPluginBase
     private static bool TryInt(string? text, out int value)
         => int.TryParse((text ?? string.Empty).Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out value)
             && value > 0;
+
+    private void CommitLocalScope(TextBox box)
+    {
+        var text = (box.Text ?? string.Empty).Trim();
+        if (string.Equals(text, Settings.Get("localScope", string.Empty), StringComparison.Ordinal)) return;
+        Settings.Set("localScope", text);   // 触发 RecomputeFromLedger
+    }
 
     private void CommitRoots(TextBox box)
     {
