@@ -1219,13 +1219,22 @@ public sealed class TokenMeterPlugin : IslandPluginBase
             if (File.Exists(path))
             {
                 _providersStamp = new FileInfo(path).LastWriteTimeUtc;
-                var reg = ProviderRegistry.Parse(File.ReadAllText(path));
+                var text = File.ReadAllText(path);
+                var reg = ProviderRegistry.Parse(text);
                 if (reg is null)
                 {
                     Log.Warn("providers.json 读不通（JSON 损坏或结构不认识）：本轮沿用上一次成功读到的配置，不会写回文件");
                     return _providers;
                 }
                 _providers = reg.Items;
+
+                // 旧版本写出来的是单行、中文还被转义成 \uXXXX，人根本没法读。
+                // 解析成功就顺手规范化一次：内容不变，只是重新序列化。
+                if (!text.Contains('\n'))
+                {
+                    WriteProvidersFile(reg.Items, out _);
+                    Log.Info("providers.json 已重新格式化为缩进可读形式");
+                }
                 return _providers;
             }
         }

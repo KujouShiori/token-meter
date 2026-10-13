@@ -499,7 +499,11 @@ public sealed class ProviderRegistry
 
     private static readonly JsonSerializerOptions JsonOpts = new()
     {
-        WriteIndented = false,
+        // providers.json 是给人手改的，必须缩进、中文原样显示。
+        // UnsafeRelaxedJsonEscaping 只放松 HTML 相关字符的转义，不影响 JSON 合法性；
+        // 这个文件不喂给 HTML。
+        WriteIndented = true,
+        Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
         PropertyNameCaseInsensitive = true,
     };
 }
