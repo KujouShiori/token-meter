@@ -16,6 +16,12 @@ public sealed class ProviderConfig
     /// <summary>总开关。关掉 = 只用本地日志，行为和 1.0.0 完全一致。</summary>
     public bool Enabled { get; set; }
 
+    /// <summary>
+    /// 接口来源的稳定标识。云端账本与水位线按它分份，所以改 DisplayName 不会影响已有数据。
+    /// 单接口时代的配置里没有这个字段，反序列化后为空，由 ProviderRegistry.EnsureIds 补。
+    /// </summary>
+    public string Id { get; set; } = "";
+
     public string DisplayName { get; set; } = "自定义接口";
 
     /// <summary>接口根地址，例如 https://api.example.com/v1（不带末尾斜杠）。</summary>
@@ -412,6 +418,125 @@ public sealed class ProviderState
         if (string.IsNullOrWhiteSpace(json)) return new ProviderState();
         try { return JsonSerializer.Deserialize<ProviderState>(json, JsonOpts) ?? new ProviderState(); }
         catch (Exception) { return new ProviderState(); }
+    }
+
+    private static readonly JsonSerializerOptions JsonOpts = new() { WriteIndented = false };
+}
+
+/// <summary>
+/// 接口来源列表，存在宿主设置的 provider 键里。
+///
+/// 读取兼容三种形态：单个对象（1.1.0 及更早）、数组（多接口时代）、空值。
+/// **解析失败返回 null 而不是默认配置**：保存是整键覆盖写回，
+/// 一旦把默认值当解析结果写回去，用户的真实配置就被抹掉了。
+/// </summary>
+public sealed class ProviderRegistry
+{
+    public List<ProviderConfig> Items { get; set; } = new();
+
+    public static ProviderRegistry? Parse(string? json)
+    {
+        var raw = (json ?? string.Empty).Trim();
+        if (raw.Length == 0) return new ProviderRegistry();
+
+        try
+        {
+            if (raw[0] == '[')
+            {
+                var list = JsonSerializer.Deserialize<List<ProviderConfig>>(raw, JsonOpts);
+                if (list is null) return null;
+                var reg = new ProviderRegistry { Items = list };
+                reg.EnsureIds();
+                return reg;
+            }
+
+            if (raw[0] == '{')
+            {
+                var one = JsonSerializer.Deserialize<ProviderConfig>(raw, JsonOpts);
+                if (one is null) return null;
+                var reg = new ProviderRegistry();
+                reg.Items.Add(one);
+                reg.EnsureIds();
+                return reg;
+            }
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+
+        return null;
+    }
+
+    /// <summary>给缺 id 的条目补一个，并把重复 id 改掉——同 id 会让两份账本互相覆盖。</summary>
+    public void EnsureIds()
+    {
+        foreach (var c in Items)
+            if (string.IsNullOrWhiteSpace(c.Id)) c.Id = NewId();
+
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var c in Items)
+        {
+            while (!seen.Add(c.Id)) c.Id = NewId();
+        }
+    }
+
+    public static string NewId() => Guid.NewGuid().ToString("N")[..12];
+
+    public string ToJson() => JsonSerializer.Serialize(Items, JsonOpts);
+
+    private static readonly JsonSerializerOptions JsonOpts = new()
+    {
+        WriteIndented = false,
+        PropertyNameCaseInsensitive = true,
+    };
+}
+
+/// <summary>
+/// 按接口 id 分份的同步状态，存在 .cache 的 provider-state-v2.json。
+///
+/// 不能沿用 v1 的原因：v1 的 CoveredUntilUtc 与 ServerDays 是**全局单份**的。
+/// 多接口共用一个水位线时，A 接口拉过的区间会直接遮住 B 接口，让它永远不再被请求。
+/// v1 只在首次启动时读一次用于迁移，之后只写 v2。
+/// </summary>
+public sealed class MultiProviderState
+{
+    public Dictionary<string, ProviderState> ByProvider { get; set; } = new(StringComparer.Ordinal);
+
+    public ProviderState For(string id)
+    {
+        var key = string.IsNullOrWhiteSpace(id) ? "_" : id;
+        if (!ByProvider.TryGetValue(key, out var st))
+        {
+            st = new ProviderState();
+            ByProvider[key] = st;
+        }
+        return st;
+    }
+
+    /// <summary>把单接口时代的 v1 状态挂到迁移出来的那个 id 下。v2 里已有该 id 就不覆盖。</summary>
+    public void AdoptLegacy(string id, ProviderState legacy)
+    {
+        if (legacy is null || string.IsNullOrWhiteSpace(id)) return;
+        if (ByProvider.ContainsKey(id)) return;
+        ByProvider[id] = legacy;
+    }
+
+    /// <summary>接口被删掉后把它的账本一起丢掉，否则状态文件里会留下没人读的孤儿条目。</summary>
+    public void DropOrphans(IEnumerable<string> aliveIds)
+    {
+        var alive = new HashSet<string>(aliveIds, StringComparer.Ordinal);
+        foreach (var stale in ByProvider.Keys.Where(k => !alive.Contains(k)).ToList())
+            ByProvider.Remove(stale);
+    }
+
+    public string ToJson() => JsonSerializer.Serialize(this, JsonOpts);
+
+    public static MultiProviderState Parse(string? json)
+    {
+        if (string.IsNullOrWhiteSpace(json)) return new MultiProviderState();
+        try { return JsonSerializer.Deserialize<MultiProviderState>(json, JsonOpts) ?? new MultiProviderState(); }
+        catch (Exception) { return new MultiProviderState(); }
     }
 
     private static readonly JsonSerializerOptions JsonOpts = new() { WriteIndented = false };
