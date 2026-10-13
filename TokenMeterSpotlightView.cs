@@ -52,8 +52,14 @@ public sealed class TokenMeterSpotlightView : UserControl
 
     private const double BarAreaHeight = 123.2 * DataTextScale;   // 112 × 1.1：柱体加高 10%
 
-    /// <summary>除首列（星型，模型名）外六列的基准宽：请求/输入/输出/缓存读/合计/费用。</summary>
-    private static readonly double[] TableColWidths = { 36, 44, 50, 56, 56, 74 };
+    /// <summary>明细表六列（请求/输入/输出/缓存读/合计/费用）的下限与上限，已按字号缩放。
+    /// 基准数放在 <see cref="TableLayout"/> 里，断言与界面共用同一组，不会漂。
+    /// 列宽现在按内容算，不再写死 —— 写死会把 244.75M 切成 244.7…</summary>
+    private static readonly double[] TableColMinPx = TableLayout.BaseMin.Select(D).ToArray();
+    private static readonly double[] TableColMaxPx = TableLayout.BaseMax.Select(D).ToArray();
+
+    /// <summary>首列（模型名）至少留出的宽度。</summary>
+    private static readonly double FirstColMinWidth = D(TableLayout.BaseFirstColMin);
 
     /// <summary>明细表**每个来源**最多列几个模型（不是全表合计），超出就折成一句提示。
     /// 卡片是纵向可滚的，所以这里限制的是"一眼看得完"而不是空间。</summary>
@@ -544,49 +550,37 @@ public sealed class TokenMeterSpotlightView : UserControl
             return;
         }
 
-        _table.Children.Add(TableRow("模型", "请求", "输入", "输出", "缓存读", "合计", "费用", header: true));
+        // 先把内容收集成纯字符串，才能按「这一列最长的那条有多宽」算列宽。
+        // 之前是边算边往面板里塞，列宽只能写死，写死就会切数字（见 TableLayout 的注释）。
+        var header = new[] { "模型", "请求", "输入", "输出", "缓存读", "合计", "费用" };
+        // Note 有两种：来源分组标题（用强调色）和"另有 N 个模型"（用淡色），所以带个标记区分
+        var items = new List<(string[]? Cells, string? Note, bool IsGroup)>();
 
         foreach (var b in blocks)
         {
             // 上限必须**逐来源**算。原来是个跨来源共享的计数器，于是第三个来源
             // 一进来就已经超了上限，整块明细被静默丢掉，而那行提示用的又是这个来源自己的模型数
             // 减去共享计数 —— 数字既不对、丢掉的明细也没人知道。
-            var shown = 0;
-
-            // 归属标签：只写来源名与口径，币种与金额在上面那栏 KPI 里已经给了
-            if (multi)
-            {
-                _table.Children.Add(new TextBlock
-                {
-                    Text = b.Name,
-                    FontSize = D(11),
-                    Foreground = _accentBrush,
-                    Margin = new Thickness(0, S(6), 0, S(2)),
-                });
-            }
+            if (multi) items.Add((null, b.Name, true));
 
             if (b.TodayByModel.Count == 0)
             {
-                _table.Children.Add(TableRow("（今日无用量）", "—", "—", "—", "—", "—", "—", header: false));
+                items.Add((new[] { "（今日无用量）", "—", "—", "—", "—", "—", "—" }, null, false));
                 continue;
             }
 
+            var shown = 0;
             foreach (var m in b.TodayByModel)
             {
                 if (shown >= MaxTableRowsPerSource)
                 {
-                    _table.Children.Add(new TextBlock
-                    {
-                        Text = $"…另有 {b.TodayByModel.Count - shown} 个模型未列出",
-                        FontSize = D(11),
-                        Foreground = _faintBrush,
-                        Margin = new Thickness(0, S(4), 0, 0),
-                    });
+                    items.Add((null, $"…另有 {b.TodayByModel.Count - shown} 个模型未列出", false));
                     break;
                 }
                 // 服务端报了金额就用它，否则是本地单价估算；一律用该来源自己的币种
                 var serverCost = m.C.FromServer && m.C.Cost > 0;
-                _table.Children.Add(TableRow(
+                items.Add((new[]
+                {
                     m.Model,
                     m.C.Requests.ToString(System.Globalization.CultureInfo.InvariantCulture),
                     Format.Tokens(m.C.Input),
@@ -596,21 +590,62 @@ public sealed class TokenMeterSpotlightView : UserControl
                     serverCost
                         ? Format.Money(b.Currency, (decimal)m.C.Cost)
                         : (m.Priced ? Format.Money(b.Currency, m.Cost) : "未定价"),
-                    header: false));
+                }, null, false));
                 shown++;
             }
         }
+
+        var numeric = TableLayout.ColumnWidths(
+            header[1..],
+            items.Where(x => x.Cells is not null).Select(x => x.Cells![1..]).ToList(),
+            D(12), TableColMinPx, TableColMaxPx);
+        var fitted = FitToWidth(numeric);
+
+        _table.Children.Add(TableRow(header, fitted, header: true));
+        foreach (var (cells, note, isGroup) in items)
+        {
+            if (cells is not null)
+            {
+                _table.Children.Add(TableRow(cells, fitted, header: false));
+                continue;
+            }
+            if (note is null) continue;
+            _table.Children.Add(new TextBlock
+            {
+                Text = note,
+                FontSize = D(11),
+                Foreground = isGroup ? _accentBrush : _faintBrush,
+                Margin = new Thickness(0, isGroup ? S(6) : S(4), 0, isGroup ? S(2) : 0),
+            });
+        }
     }
 
-    private UIElement TableRow(string c0, string c1, string c2, string c3, string c4, string c5, string c6, bool header)
+    /// <summary>
+    /// 极端情况下（模型名特别长、金额位数特别多）算出来的列宽仍可能把首列挤没，
+    /// 所以按比例缩到"至少给模型名留下 <see cref="FirstColMinWidth"/> 的空间"。
+    /// 缩完仍然放不下就让它去截断数字列 —— 首列是人名，截不得。
+    /// </summary>
+    private static double[] FitToWidth(double[] numeric)
+    {
+        var spacing = S(8);
+        var taken = numeric.Sum() + spacing * numeric.Length;
+        var room = ChartUsableWidth - taken;
+        if (room >= FirstColMinWidth) return numeric;
+
+        var budget = ChartUsableWidth - spacing * numeric.Length - FirstColMinWidth;
+        if (budget <= 0) return numeric.Select(x => TableColMinPx[0]).ToArray();
+        var scale = budget / numeric.Sum();
+        return numeric.Select(x => x * scale).ToArray();
+    }
+
+    private UIElement TableRow(string[] texts, double[] numericWidths, bool header)
     {
         var grid = new Grid { ColumnSpacing = S(8), Padding = new Thickness(0, S(2), 0, S(2)) };
         grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-        foreach (var w in TableColWidths)
-            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(D(w)) });
+        foreach (var w in numericWidths)
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(w) });
 
-        var texts = new[] { c0, c1, c2, c3, c4, c5, c6 };
-        for (var i = 0; i < texts.Length; i++)
+        for (var i = 0; i < texts.Length && i < 7; i++)
         {
             var tb = new TextBlock
             {

@@ -1,6 +1,84 @@
 namespace TokenMeter;
 
 /// <summary>
+/// 明细表的列宽分配。列宽原来是一串写死的数（36/44/50/56/56/74），
+/// 结果「输入」那列只有 60px，而 2.4 亿 token 格式化出来是 <c>244.75M</c> 七个字符 ≈ 63px，
+/// 于是被省略号切成 <c>244.7…</c> —— 数字没错，是列宽按猜的写死、没跟着实际字符串走。
+/// 所以这里改成按「这一列里最长的文本有多宽」算，并且做成纯函数：
+/// 字体度量在测试工程里拿不到（WinUI 的 FormattedText 起不来），只能估，
+/// 但"够不够宽"这个判断本身可以断言。
+/// </summary>
+public static class TableLayout
+{
+    /// <summary>六列（请求/输入/输出/缓存读/合计/费用）的**基准宽度下限**（未缩放）。
+    /// 放在这里而不是视图里，是为了让断言和界面用同一组数 —— 测试里另抄一份就会漂。</summary>
+    public static readonly double[] BaseMin = { 30, 34, 34, 34, 34, 40 };
+
+    /// <summary>
+    /// 上限（未缩放）。取数的依据是"这一列现实里最长的字符串有多宽"：
+    /// 费用列 <c>¥1,701.3</c> 约 4.6em、token 列 <c>244.75M</c> 约 4.1em、请求列 <c>999,999</c> 约 3.9em。
+    /// ⚠ 这组数必须满足：六列全撑到上限 + 六个列间距 + 首列下限 &lt;= 卡片可用宽，
+    ///   否则最坏情况整张表放不下、首列被挤没。有断言直接盯着这条（曾经写松过一回）。
+    /// </summary>
+    public static readonly double[] BaseMax = { 48, 52, 52, 52, 52, 58 };
+
+    /// <summary>首列（模型名）至少留出的基准宽度：deepseek-v4-flash 不能被挤成三个字。</summary>
+    public const double BaseFirstColMin = 94;
+
+    /// <summary>
+    /// 单字宽度估算（单位 px）。分四类：中日韩全角 ≈ 1.0em、数字与常见符号 ≈ 0.58em、
+    /// 窄标点 ≈ 0.32em、货币与百分号这类宽符号 ≈ 0.92em。
+    /// 刻意估得偏宽一点：宁可留白，也不要又切掉数字。
+    /// </summary>
+    public static double GlyphWidth(char ch, double fontPx)
+    {
+        if (ch >= 0x2E80) return fontPx;                       // CJK 与全角标点（含破折号 —、括号）
+        if (ch is >= '0' and <= '9') return fontPx * 0.60;      // 数字（Segoe 的数字是等宽的）
+        if (ch is '.' or ',' or ':' or ';' or '\'' or '-' or ' ') return fontPx * 0.34;
+        if (ch is '¥' or '￥' or '$' or '%' or '#' or '@') return fontPx * 0.92;
+        if (char.IsUpper(ch)) return fontPx * 0.72;             // M / B 这类单位字母
+        return fontPx * 0.56;                                   // 其余拉丁字母
+    }
+
+    public static double TextWidth(string? text, double fontPx)
+    {
+        if (string.IsNullOrEmpty(text)) return 0;
+        var w = 0.0;
+        foreach (var ch in text) w += GlyphWidth(ch, fontPx);
+        return w;
+    }
+
+    /// <summary>
+    /// 每列取「表头与所有数据行里最宽的那条」，再夹到 [min, max] 之间。
+    /// max 存在的意义是防止某个异常长的模型名或金额把整张表撑破 —— 首列（模型名）是星型列，
+    /// 数字列一宽，它就被挤成省略号，那是更糟的失败方式。
+    /// </summary>
+    public static double[] ColumnWidths(
+        IReadOnlyList<string> header, IReadOnlyList<string[]> rows, double fontPx,
+        IReadOnlyList<double> minPx, IReadOnlyList<double> maxPx)
+    {
+        var cols = header.Count;
+        var widths = new double[cols];
+        for (var c = 0; c < cols; c++)
+        {
+            var need = TextWidth(header[c], fontPx);
+            foreach (var r in rows)
+                if (c < r.Length) need = Math.Max(need, TextWidth(r[c], fontPx));
+
+            widths[c] = Math.Clamp(need, minPx[c], maxPx[c]);
+        }
+        return widths;
+    }
+
+    /// <summary>数字列加起来（含列间距）是否还留得下首列。留给首列不足 minWidth 就是放不下。</summary>
+    public static bool Fits(IReadOnlyList<double> numericWidths, double spacingPx, double usableWidth, double firstColMinWidth)
+    {
+        var sum = numericWidths.Sum() + spacingPx * numericWidths.Count;
+        return usableWidth - sum >= firstColMinWidth;
+    }
+}
+
+/// <summary>
 /// 近 7 天柱状图的几何分配。两种画法：
 ///   · grouped（分组）= 一天里每个来源一根柱并排 —— 能直接比谁的形状，但两家量级差几十倍时，
 ///     小的那根几乎看不见；

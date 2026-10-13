@@ -29,6 +29,7 @@ internal static class Program
         SplitManyTests();
         RegistryTests();
         ChartLayoutTests();
+        TableLayoutTests();
         AlertTests();
         DayPointTests();
         IslandLayoutTests();
@@ -412,6 +413,58 @@ internal static class Program
                 fieldLines.Count > 0 && uncommented.Count == 0,
                 $"共 {fieldLines.Count} 行，没说明的：" + string.Join(" | ", uncommented));
         }
+    }
+
+    // ---------------- 明细表列宽 ----------------
+
+    /// <summary>
+    /// 这条是用户截图里发现的：「输入」列显示成 <c>244.7…</c>。数字没错，
+    /// 是列宽写死成 44（缩放后 60.7px）而 "244.75M" 需要 ~63px。
+    /// 断言同时钉住两件事：算出来的宽度必须真的够放，且六列都撑到上限时整张表仍放得进卡片。
+    /// </summary>
+    private static void TableLayoutTests()
+    {
+        const double layoutScale = 0.7 * 1.2;
+        const double dataScale = 1.15 * 1.2;
+        var font = 12 * dataScale;                       // 视图里数据行的字号 D(12)
+        var spacing = 8 * layoutScale;                   // 列间距 S(8)
+        var usable = 616 * 1.2 - 2 * (30 * layoutScale) - 18 * layoutScale;
+
+        var wide = TableLayout.TextWidth("244.75M", font);
+        Check("估算认为 244.75M 放不下原来那个 44 的列宽（这条就是用户看到的 bug）",
+            wide > 44 * dataScale, $"{wide:F1}px vs 写死的 {44 * dataScale:F1}px");
+        Check("也放不下 6 个字符的 481.5M 会被误判成够窄（估算方向要对）",
+            wide > TableLayout.TextWidth("481.5M", font), "更长的串反而估得更窄");
+        Check("CJK 表头比数字宽（缓存读 三个字要占得下）",
+            TableLayout.TextWidth("缓存读", font) > TableLayout.TextWidth("971", font), "全角没按全角算");
+        Check("空与 null 宽度为 0",
+            TableLayout.TextWidth("", font) == 0 && TableLayout.TextWidth(null, font) == 0, "不是 0");
+
+        var header = new[] { "请求", "输入", "输出", "缓存读", "合计", "费用" };
+        var rows = new List<string[]>
+        {
+            new[] { "971", "244.75M", "702.8k", "236M", "481.5M", "¥1,701.3" },
+            new[] { "—", "—", "—", "—", "—", "—" },
+        };
+        var min = TableLayout.BaseMin.Select(v => v * dataScale).ToArray();
+        var max = TableLayout.BaseMax.Select(v => v * dataScale).ToArray();
+        var w = TableLayout.ColumnWidths(header, rows, font, min, max);
+
+        Check("输入列被撑到真的放得下 244.75M", w[1] + 1e-9 >= wide, $"{w[1]:F1} < {wide:F1}");
+        Check("每列都在 [下限, 上限] 之间",
+            w.Zip(min).All(p => p.First >= p.Second - 1e-9)
+            && w.Zip(max).All(p => p.First <= p.Second + 1e-9),
+            string.Join(",", w.Select(x => x.ToString("F1"))));
+        Check("表头比数据宽时按表头算（合计列至少容得下「合计」两个字）",
+            w[4] + 1e-9 >= TableLayout.TextWidth("合计", font), "表头被切");
+
+        // 最坏情况：六列全部撑到上限，整张表还得放得进卡片
+        Check("六列都取上限时仍放得进卡片（首列不会被挤没）",
+            TableLayout.Fits(max, spacing, usable, TableLayout.BaseFirstColMin * dataScale),
+            $"sum={max.Sum() + spacing * 6:F1} usable={usable:F1}");
+        Check("反证：真有列宽到 400 时 Fits 要报放不下（不是永远为真）",
+            !TableLayout.Fits(new double[] { 400, 400, 400, 400, 400, 400 }, spacing, usable, 100),
+            "永远返回 true 就是没在检查");
     }
 
     // ---------------- 近 7 天柱状图几何 ----------------
