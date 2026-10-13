@@ -167,6 +167,10 @@ public sealed class Snapshot
 
     /// <summary>本地范围外被丢掉的模型：不在卡片上显示，只进设置页状态行。</summary>
     public string SplitWarning { get; set; } = "";
+
+    /// <summary>主块的阈值告警短标签（"超预算"）。紧凑态没地方放句子，只能给这一个标记；
+    /// 完整句子在 <see cref="ProviderNote"/> 里，展开态与聚光卡读得到。</summary>
+    public string AlertTag { get; set; } = "";
 }
 
 /// <summary>按「本地日期 -> 模型 -> 计数」组织的账本。</summary>
@@ -401,6 +405,7 @@ public static class SnapshotBuilder
         snap.UnpricedNames = b.UnpricedNames;
         snap.HasData = b.HasData;
         snap.LedgerDays = b.LedgerDays;
+        snap.AlertTag = b.AlertTag;
     }
 
     /// <summary>

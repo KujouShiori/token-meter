@@ -200,6 +200,9 @@ public sealed class TokenMeterView : UserControl, IMorphView
         }
 
         var c = s.Today.C;
+        // 紧凑态只有 268 宽，放不下"今日 ¥213 已达预算 ¥200"这种句子，但一个 ⚠ 放得下：
+        // 预算超了却没任何提示，比多一个符号难看要紧得多
+        if (!string.IsNullOrEmpty(s.AlertTag) && _cost.Text != "—") _cost.Text += " ⚠";
         _breakdown.Text = $"输入 {Format.Tokens(c.Input)} · 输出 {Format.Tokens(c.Output)} · 缓存读 {Format.Tokens(c.CacheRead)} · {c.Requests} 次请求";
 
         // 岛面展开态能用的垂直空间是固定的，而「来源数」是这次新长出来的变量。
@@ -241,9 +244,10 @@ public sealed class TokenMeterView : UserControl, IMorphView
                 var at = b.SummaryAtUtc is null ? string.Empty : $"（{Format.Ago(b.SummaryAtUtc.Value)}更新）";
                 _otherHost.Children.Add(new TextBlock
                 {
-                    Text = $"{b.Name} 余额 {Format.Money(b.Currency, b.SummaryValue!.Value)}{at}",
+                    Text = $"{b.Name} 余额 {Format.Money(b.Currency, b.SummaryValue!.Value)}{at}"
+                         + (string.IsNullOrEmpty(b.AlertTag) ? string.Empty : "  ⚠" + b.AlertTag),
                     FontSize = 11.5,
-                    Foreground = _mutedBrush,
+                    Foreground = string.IsNullOrEmpty(b.AlertTag) ? _mutedBrush : _accentBrush,
                     TextTrimming = TextTrimming.CharacterEllipsis,
                 });
                 otherRows++;
@@ -261,9 +265,10 @@ public sealed class TokenMeterView : UserControl, IMorphView
 
             _otherHost.Children.Add(new TextBlock
             {
-                Text = $"{b.Name}  {Format.Tokens(b.Today.C.Total)} tok  {costText}",
+                Text = $"{b.Name}  {Format.Tokens(b.Today.C.Total)} tok  {costText}"
+                     + (string.IsNullOrEmpty(b.AlertTag) ? string.Empty : "  ⚠" + b.AlertTag),
                 FontSize = 11.5,
-                Foreground = _mutedBrush,
+                Foreground = string.IsNullOrEmpty(b.AlertTag) ? _mutedBrush : _accentBrush,
                 TextTrimming = TextTrimming.CharacterEllipsis,
             });
             otherRows++;
@@ -280,7 +285,8 @@ public sealed class TokenMeterView : UserControl, IMorphView
 
         _detailHeight = detailHeight;
 
-        _totals.Text = $"本周 {Format.Money(s.Currency, s.Week.Cost)} · 本月 {Format.Money(s.Currency, s.Month.Cost)} · 累计 {Format.Money(s.Currency, s.All.Cost)}";
+        _totals.Text = $"本周 {Format.Money(s.Currency, s.Week.Cost)} · 本月 {Format.Money(s.Currency, s.Month.Cost)} · 累计 {Format.Money(s.Currency, s.All.Cost)}"
+            + (string.IsNullOrEmpty(s.AlertTag) ? string.Empty : $"　⚠{s.AlertTag}");
     }
 
     private UIElement MakeRow(ModelUsage m, string currency)

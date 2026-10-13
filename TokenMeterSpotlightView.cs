@@ -217,7 +217,8 @@ public sealed class TokenMeterSpotlightView : UserControl
                 // 硬套五格 KPI 会画出五个「—」，看起来像数据坏了
                 wrap.Children.Add(new TextBlock
                 {
-                    Text = $"{b.Name} ｜ {b.Currency} ｜ 余额（某一刻的总额，不进按天统计与柱状图）",
+                    Text = $"{b.Name} ｜ {b.Currency} ｜ 余额（某一刻的总额，不进按天统计与柱状图）"
+                         + (string.IsNullOrEmpty(b.AlertTag) ? string.Empty : " ｜ ⚠" + b.AlertTag),
                     FontSize = T(11),
                     Foreground = _faintBrush,
                 });
@@ -231,7 +232,8 @@ public sealed class TokenMeterSpotlightView : UserControl
 
             wrap.Children.Add(new TextBlock
             {
-                Text = $"{b.Name} ｜ {b.Currency} ｜ {b.Today.CostBasis}",
+                Text = $"{b.Name} ｜ {b.Currency} ｜ {b.Today.CostBasis}"
+                     + (string.IsNullOrEmpty(b.AlertTag) ? string.Empty : " ｜ ⚠" + b.AlertTag),
                 FontSize = T(11),
                 Foreground = _faintBrush,
             });

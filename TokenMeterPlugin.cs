@@ -88,6 +88,7 @@ public sealed class TokenMeterPlugin : IslandPluginBase
         Context.Register(Context.OnSettingsChanged("pricing", OnPricingChanged));
         Context.Register(Context.OnSettingsChanged("roots", () => _ = RefreshAsync("数据目录变更")));
         Context.Register(Context.OnSettingsChanged("localScope", () => RecomputeFromLedger("模型归属变更")));
+        Context.Register(Context.OnSettingsChanged("localBudget", () => RecomputeFromLedger("本地预算变更")));
         // provider 键不再监听：接口配置已搬到 providers.json，由心跳查文件变化
         Context.Register(Context.OnSettingsChanged("refreshSeconds", () => { _secondsSinceRefresh = 0; }));
 
@@ -365,6 +366,8 @@ public sealed class TokenMeterPlugin : IslandPluginBase
                 serverPricing.Currency = string.IsNullOrWhiteSpace(live[i].Currency) ? "$" : live[i].Currency.Trim();
 
                 var sb = SnapshotBuilder.BuildBlock(assigned[i].Ledger, serverPricing, live[i].DisplayName);
+                (sb.AlertTag, sb.AlertDetail) = SourceAlert.ForBudget(
+                    sb.Today.Cost, live[i].DailyBudget, live[i].DisplayName, sb.Currency);
                 byId[live[i].Id] = sb;
                 MaybeLogReconcileSample(sb, live[i]);
             }
@@ -386,23 +389,43 @@ public sealed class TokenMeterPlugin : IslandPluginBase
             localBlock = SnapshotBuilder.BuildBlock(local, pricing, "本地日志");
         }
 
+        // 本地块的预算走宿主设置，和 roots / localScope 同类：本地侧的旋钮不进 providers.json，
+        // 那个文件只管云端接口。预算按本地币种（单价配置里的那个）。
+        var localBudget = ReadAmountSetting("localBudget");
+        (localBlock.AlertTag, localBlock.AlertDetail) = SourceAlert.ForBudget(
+            localBlock.Today.Cost, localBudget, "本地日志", localBlock.Currency);
+
         foreach (var p in balances)
         {
             var (amount, atUtc) = _balances[p.Id];
-            byId[p.Id] = new SourceBlock
+            var balanceCurrency = string.IsNullOrWhiteSpace(p.Currency) ? "$" : p.Currency.Trim();
+            var block = new SourceBlock
             {
                 Name = p.DisplayName,
-                Currency = string.IsNullOrWhiteSpace(p.Currency) ? "$" : p.Currency.Trim(),
+                Currency = balanceCurrency,
                 HasData = true,
                 SummaryValue = amount,
                 SummaryAtUtc = atUtc,
             };
+            (block.AlertTag, block.AlertDetail) = SourceAlert.ForBalance(
+                amount, p.BalanceWarnBelow, p.DisplayName, balanceCurrency);
+            byId[p.Id] = block;
         }
 
         // 显示顺序 = providers.json 里的书写顺序（本地块恒为第一位）：
         // 岛面只够几行，谁被折掉就是这条顺序决定的，写在前面就排前面
         var blocks = SnapshotBuilder.OrderBlocks(
             providers.Select(p => p.Id).ToList(), localBlock, byId);
+
+        // 阈值告警的完整句子并进 ProviderNote —— 那是状态行与聚光卡都在读的现成通道。
+        // 岛面那一行只放短标签：句子在 430 宽的岛上放不下，而且会挤掉数字。
+        var alerts = blocks
+            .Select(b => b.AlertDetail)
+            .Where(s => !string.IsNullOrEmpty(s))
+            .ToList();
+        if (alerts.Count > 0)
+            note = string.IsNullOrEmpty(note) ? string.Join("；", alerts) : note + "；" + string.Join("；", alerts);
+        MaybeLogAlerts(alerts);
 
         // Blocks[0] 恒为本地块，主块从这里挑。余额块不当选：它没有「今日/本周」的概念，
         // 让它当主块会让岛面标题显示成一个余额数字。
@@ -567,6 +590,32 @@ public sealed class TokenMeterPlugin : IslandPluginBase
             + "挑一天拿「上报」去对网关控制台账单。推算持续**高于**上报＝有东西被重复计费，"
             + "当前若是 false 就该改 true；持续**低于**＝少算了，当前若是 true 就该改 false。"
             + "两种情况都要先排除单价本身填错或该模型未定价。\n" + string.Join("\n", lines));
+    }
+
+    /// <summary>读一个金额型设置。填错、留空、填 0 或负数一律当"不启用" ——
+    /// 一个手抖打错的预算线不该变成"任何用量都超预算"。</summary>
+    private double ReadAmountSetting(string key)
+    {
+        var raw = (Settings.Get(key, string.Empty) ?? string.Empty).Trim();
+        foreach (var sym in new[] { "¥", "￥", "$", "％", "%" }) raw = raw.Replace(sym, string.Empty);
+        return double.TryParse(raw, NumberStyles.Float, CultureInfo.InvariantCulture, out var v) && v > 0
+             && !double.IsNaN(v) && !double.IsInfinity(v)
+            ? v : 0;
+    }
+
+    private string _lastAlertNote = string.Empty;
+
+    /// <summary>阈值告警只有一条：内容变了才记，全部解除时补一条恢复。
+    /// 预算和余额都是"每分钟看一次"的指标，不设这个闸就会像当初的 401 那样把日志埋掉。</summary>
+    private void MaybeLogAlerts(List<string> alerts)
+    {
+        var joined = string.Join("；", alerts);
+        if (string.Equals(joined, _lastAlertNote, StringComparison.Ordinal)) return;
+
+        if (alerts.Count > 0) Log.Warn("阈值告警：" + joined + "（只是提示，不改任何数字）");
+        else if (_lastAlertNote.Length > 0) Log.Info("阈值告警已解除，上一轮：" + _lastAlertNote);
+
+        _lastAlertNote = joined;
     }
 
     private void RememberProviderFailure(string id, string note)
@@ -881,6 +930,22 @@ public sealed class TokenMeterPlugin : IslandPluginBase
             if (e.Key == Windows.System.VirtualKey.Enter) CommitLocalScope(localScopeBox);
         };
         page.Children.Add(Card(localScopeBox));
+
+        // ---- 本地日志的今日预算（云端各家的预算写在 providers.json 里）----
+        var localBudgetBox = new TextBox
+        {
+            Header = "本地日志今日预算（用单价配置里的货币符号；留空或 0 = 不提醒）",
+            Text = Settings.Get("localBudget", string.Empty),
+            PlaceholderText = "例如 200",
+            MinWidth = 260,
+            HorizontalAlignment = HorizontalAlignment.Left,
+        };
+        localBudgetBox.LostFocus += (_, _) => CommitLocalBudget(localBudgetBox);
+        localBudgetBox.KeyDown += (_, e) =>
+        {
+            if (e.Key == Windows.System.VirtualKey.Enter) CommitLocalBudget(localBudgetBox);
+        };
+        page.Children.Add(Card(localBudgetBox));
 
         // ---- 货币符号 + 单价基数 ----
         var currencyBox = new TextBox
@@ -1398,6 +1463,13 @@ public sealed class TokenMeterPlugin : IslandPluginBase
         var text = (box.Text ?? string.Empty).Trim();
         if (string.Equals(text, Settings.Get("localScope", string.Empty), StringComparison.Ordinal)) return;
         Settings.Set("localScope", text);   // 触发 RecomputeFromLedger
+    }
+
+    private void CommitLocalBudget(TextBox box)
+    {
+        var text = (box.Text ?? string.Empty).Trim();
+        if (string.Equals(text, Settings.Get("localBudget", string.Empty), StringComparison.Ordinal)) return;
+        Settings.Set("localBudget", text);   // 触发 RecomputeFromLedger
     }
 
     private void CommitRoots(TextBox box)

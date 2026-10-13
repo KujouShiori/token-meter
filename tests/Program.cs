@@ -28,6 +28,7 @@ internal static class Program
         UndercountTests();
         SplitManyTests();
         RegistryTests();
+        AlertTests();
         DayPointTests();
         IslandLayoutTests();
         BalanceTests();
@@ -410,6 +411,57 @@ internal static class Program
                 fieldLines.Count > 0 && uncommented.Count == 0,
                 $"共 {fieldLines.Count} 行，没说明的：" + string.Join(" | ", uncommented));
         }
+    }
+
+    // ---------------- 阈值告警（今日预算 / 余额预警） ----------------
+
+    /// <summary>
+    /// 告警会咬人的地方全在"什么时候不该响"：预算线手抖填成 0 或负数不能变成"任何用量都超"，
+    /// 未定价时金额是 0 不该报超预算，余额刚好等于预警线按口径不该响。
+    /// </summary>
+    private static void AlertTests()
+    {
+        var (offTag, offDetail) = SourceAlert.ForBudget(999m, 0, "我的网关", "$");
+        Check("预算线为 0 = 不启用（不能变成任何用量都超）", offTag.Length == 0 && offDetail.Length == 0, offTag);
+
+        Check("填成负数、NaN、无穷都当关闭，不是「一直告警」",
+            SourceAlert.ForBudget(1m, -50, "x", "$").Tag.Length == 0
+            && SourceAlert.ForBudget(1m, double.NaN, "x", "$").Tag.Length == 0
+            && SourceAlert.ForBudget(1m, double.PositiveInfinity, "x", "$").Tag.Length == 0
+            && SourceAlert.ForBalance(1m, -1, "x", "$").Tag.Length == 0, "有一个还在响");
+
+        var under = SourceAlert.ForBudget(199.9m, 200, "本地日志", "¥");
+        Check("没到预算不响", under.Tag.Length == 0 && under.Detail.Length == 0, under.Tag);
+
+        var hit = SourceAlert.ForBudget(200m, 200, "本地日志", "¥");
+        Check("达到预算就响（等到「超过」才提示就太晚了）", hit.Tag == "超预算", $"tag={hit.Tag}");
+        Check("告警句子带上来源、当前金额与预算线",
+            hit.Detail.Contains("本地日志") && hit.Detail.Contains("¥200") && hit.Detail.Contains("200"),
+            hit.Detail);
+
+        Check("未定价时金额是 0，不该报超预算",
+            SourceAlert.ForBudget(0m, 100, "我的网关", "$").Tag.Length == 0, "没配单价就天天告警");
+
+        var cur = SourceAlert.ForBudget(0.5m, 0.4, "我的网关", "$");
+        Check("云端来源用它自己的币种，不是本地那个 ¥",
+            cur.Detail.Contains("$") && !cur.Detail.Contains("¥"), cur.Detail);
+
+        var eq = SourceAlert.ForBalance(5m, 5, "钱包", "$");
+        Check("余额等于预警线不算「低于」，不响", eq.Tag.Length == 0, eq.Tag);
+        var low = SourceAlert.ForBalance(4.99m, 5, "钱包", "$");
+        Check("余额低于预警线才响", low.Tag == "余额偏低" && low.Detail.Contains("低于预警线"), $"tag={low.Tag} {low.Detail}");
+        Check("余额为 0 当然要响（清零是最该提示的一刻）",
+            SourceAlert.ForBalance(0m, 5, "钱包", "$").Tag == "余额偏低", "被当成没数据跳过了");
+
+        // 视图读的是快照顶层字段，主块的告警必须被 CopyBlock 带上去
+        var block = SnapshotBuilder.BuildBlock(new UsageLedger(),
+            PricingConfig.Parse("{\"Currency\":\"¥\",\"PerTokens\":1000000,\"Models\":[]}"), "本地日志");
+        block.AlertTag = "超预算";
+        var snap = new Snapshot();
+        SnapshotBuilder.CopyBlock(snap, block);
+        Check("主块的告警标签会拷到快照顶层（紧凑态读的就是顶层）", snap.AlertTag == "超预算", snap.AlertTag);
+        Check("没有告警时标签是空串而不是 null（视图直接拼字符串）",
+            new SourceBlock().AlertTag.Length == 0 && new Snapshot().AlertTag.Length == 0, "默认值不对");
     }
 
     // ---------------- 近 7 天单日汇总 ----------------

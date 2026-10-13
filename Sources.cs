@@ -80,6 +80,41 @@ public sealed class SourceBlock
 
     /// <summary>这个来源是「读一个总额」型的，不参与按天统计与柱状图。</summary>
     public bool IsSummary => SummaryValue is not null;
+
+    /// <summary>阈值告警的短标签，跟在岛面那一行后面（"超预算" / "余额偏低"）。空 = 没有告警。</summary>
+    public string AlertTag { get; set; } = "";
+
+    /// <summary>同一条告警的完整句子，给状态行与聚光卡读；短标签在窄的地方放不下细节。</summary>
+    public string AlertDetail { get; set; } = "";
+}
+
+/// <summary>
+/// 阈值判定。抽成纯函数是因为"什么时候该响、什么时候不该响"是条规则，
+/// 而它会咬人：预算没配单价时不能误报，0 预算线要当"关闭"而不是"任何用量都超"，
+/// 未定价的那部分钱不该算进预算里 —— 这三条都值得钉住。
+/// </summary>
+public static class SourceAlert
+{
+    /// <summary>今日预算。<paramref name="budget"/> 小于等于 0 表示不设预算。</summary>
+    public static (string Tag, string Detail) ForBudget(decimal todayCost, double budget, string name, string currency)
+    {
+        if (!IsOn(budget) || todayCost < (decimal)budget) return (string.Empty, string.Empty);
+
+        return ("超预算",
+            $"{name}：今日 {Format.Money(currency, todayCost)} 已达预算 {Format.Money(currency, (decimal)budget)}");
+    }
+
+    /// <summary>余额预警。<paramref name="warnBelow"/> 小于等于 0 表示不预警；余额【低于】它才响。</summary>
+    public static (string Tag, string Detail) ForBalance(decimal balance, double warnBelow, string name, string currency)
+    {
+        if (!IsOn(warnBelow) || balance >= (decimal)warnBelow) return (string.Empty, string.Empty);
+
+        return ("余额偏低",
+            $"{name}：余额 {Format.Money(currency, balance)} 低于预警线 {Format.Money(currency, (decimal)warnBelow)}");
+    }
+
+    /// <summary>阈值算不算"开着"。NaN/无穷/负数都按关闭处理：填错了不该变成"一直告警"。</summary>
+    private static bool IsOn(double v) => v > 0 && !double.IsNaN(v) && !double.IsInfinity(v);
 }
 
 /// <summary>分派结果说明，用于在界面上交代「哪些模型被划给了云端」。</summary>

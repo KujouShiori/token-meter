@@ -185,6 +185,14 @@ public sealed class ProviderConfig
     public int InitialBackfillDays { get; set; } = 7;
 
     // ---- 对账告警 ----
+    /// <summary>今日预算（用 <see cref="Currency"/> 那个币种），达到就告警。0 或留空 = 不设预算。
+    /// 只影响界面提示，不影响任何数字的算法。</summary>
+    public double DailyBudget { get; set; } = 0;
+
+    /// <summary>余额预警线（<see cref="Currency"/> 单位）：余额**低于**这个数就告警。0 = 不预警。
+    /// 只对 Kind=balance 的接口有意义。</summary>
+    public double BalanceWarnBelow { get; set; } = 0;
+
     /// <summary>服务端总量比本地少超过这个比例时，界面标警告而不是静默覆盖。</summary>
     public int UndercountWarnPercent { get; set; } = 10;
 
@@ -628,6 +636,7 @@ public sealed class ProviderRegistry
     "ProviderBudgetSeconds": 45,                       // 一轮里这个接口最多花多少秒，超了就本轮先用本地日志，下轮继续
     "LedgerKeepDays": 730,                             // 云端账本在缓存里保留多少天，超出的整天丢掉。0 = 不清理
     "UndercountWarnPercent": 10,                       // 云端报的总量比本地日志少超过这个百分比时，界面标警告（多半是这个 Key 权限不全，看不见全部来源）
+    "DailyBudget": 0,                                  // 今日预算，按上面 Currency 的币种。达到就岛面标「超预算」、状态行给一句说明。0 = 不设预算
   },
   {
     "Enabled": false,                                  // 想看效果就改成 true；上面那个接口的密钥环境变量这里同样能用
@@ -642,6 +651,7 @@ public sealed class ProviderRegistry
     "CostUnitDivisor": 1,                              // 余额也是金额，所以复用同一个换算率（比如 50 万单位 = $1 的记账法就填 500000）
     "CostScale": 1,                                    // 金额字段的乘数（接口返回「分」就填 0.01）
     "Currency": "$",                                   // 这个数是什么币种
+    "BalanceWarnBelow": 0,                             // 余额预警线，按上面 Currency 的币种。余额【低于】这个数就标「余额偏低」。0 = 不预警
     "TimeoutSeconds": 15,                              // 单次请求超时
   }
 ]
