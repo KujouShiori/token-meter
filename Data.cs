@@ -171,6 +171,11 @@ public sealed class Snapshot
     /// <summary>主块的阈值告警短标签（"超预算"）。紧凑态没地方放句子，只能给这一个标记；
     /// 完整句子在 <see cref="ProviderNote"/> 里，展开态与聚光卡读得到。</summary>
     public string AlertTag { get; set; } = "";
+
+    /// <summary>近 7 天图的画法："grouped"（一天里每来源一根并排）或 "stacked"（一天一根、按来源叠色）。
+    /// 由插件在调用线程读设置后填进来 —— 视图不去读宿主设置，后台线程读设置是这类插件出
+    /// COMException 的经典位置。</summary>
+    public string ChartMode { get; set; } = ChartLayout.Grouped;
 }
 
 /// <summary>按「本地日期 -> 模型 -> 计数」组织的账本。</summary>

@@ -20,6 +20,13 @@ namespace TokenMeter;
 /// 来源数量是"用户想接几个就接几个"的，所以视图里没有任何一处写死 2：
 /// 柱宽按来源数反推、颜色四档循环加图例、明细表逐来源各自限长。
 /// 余额/汇总型来源（<see cref="SourceBlock.IsSummary"/>）不参与按天图与明细表，只在 KPI 单独一块。
+///
+/// 近 7 天图有两种画法，跟着快照的 <see cref="Snapshot.ChartMode"/> 走（设置页可换，默认分组）：
+///   分组 grouped = 一天里每个来源一根柱并排，比的是形状；
+///   堆叠 stacked = 一天一根柱、按来源从下往上叠色，读的是总量与配比。
+/// ⚠ 两种都只是"排布方式"，都改变不了刻度是共享的这件事：量级差到 10^4（本地每天几亿 token
+/// 对云端一天几万）时，**换成堆叠照样看不见小的那一家**（有断言把这条局限写死）。
+/// 真要看清小来源得换思路（逐来源各自归一，或对数轴），别指望这个开关。
 /// </summary>
 public sealed class TokenMeterSpotlightView : UserControl
 {
@@ -55,6 +62,7 @@ public sealed class TokenMeterSpotlightView : UserControl
     private readonly IIslandTheme _theme;
     private readonly StackPanel _kpiHost;
     private readonly TextBlock _legend;
+    private readonly TextBlock _chartTitle;
     private readonly Grid _bars;
     private readonly StackPanel _table;
     private readonly TextBlock _source;
@@ -128,7 +136,8 @@ public sealed class TokenMeterSpotlightView : UserControl
         };
         _table = new StackPanel { Spacing = S(2) };
 
-        var chartLabel = new TextBlock { Text = "近 7 天用量", FontSize = D(13), Foreground = _mutedBrush };
+        _chartTitle = new TextBlock { Text = "近 7 天用量", FontSize = D(13), Foreground = _mutedBrush };
+        var chartLabel = _chartTitle;
         var tableLabel = new TextBlock { Text = "今日逐模型明细", FontSize = D(13), Foreground = _mutedBrush };
 
         var root = new StackPanel
@@ -191,6 +200,10 @@ public sealed class TokenMeterSpotlightView : UserControl
             + (string.IsNullOrEmpty(s.ProviderNote) ? string.Empty : " · " + s.ProviderNote);
 
         RebuildKpis(s);
+        // 标题跟着画法写出来：不然切完模式看不出到底生效了没有
+        _chartTitle.Text = "近 7 天用量（"
+            + (string.Equals(s.ChartMode, ChartLayout.Stacked, StringComparison.OrdinalIgnoreCase) ? "堆叠" : "分组")
+            + "，柱高按 token）";
         RebuildBars(s);
         RebuildTable(s);
     }
@@ -335,23 +348,37 @@ public sealed class TokenMeterSpotlightView : UserControl
             _legend.Visibility = Visibility.Collapsed;
         }
 
+        var stacked = string.Equals(s.ChartMode, ChartLayout.Stacked, StringComparison.OrdinalIgnoreCase);
+
         // 柱高必须用同一个量做刻度。¥ 和 $ 不能比大小，所以用 token 数（跨币种可比）。
-        var maxTokens = 1L;
+        // 但"刻度取哪个最大值"两种画法不一样：
+        //   分组：每来源单独一根，取【单个来源单日】的最大值，柱子之间比的是形状；
+        //   堆叠：一天一根柱是各来源相加，必须取【相加之后】的最大日总量，
+        //         用前者做刻度的话，最高的那根叠起来会直接顶破柱区。
+        double maxSingle = 1, maxDayTotal = 1;
         for (var i = 0; i < days; i++)
+        {
+            long dayTotal = 0;
             for (var b = 0; b < blocks.Count; b++)
-                if (i < blocks[b].Last7.Count && blocks[b].Last7[i].Total > maxTokens)
-                    maxTokens = blocks[b].Last7[i].Total;
+            {
+                if (i >= blocks[b].Last7.Count) continue;
+                var t = blocks[b].Last7[i].Total;
+                if (t > maxSingle) maxSingle = t;
+                dayTotal += t;
+            }
+            if (dayTotal > maxDayTotal) maxDayTotal = dayTotal;
+        }
+        var scaleTo = stacked ? maxDayTotal : maxSingle;
 
         var corner = new CornerRadius(S(4));
-
-        // 列是星型均分的，所以每天可用的横向空间 = 可用宽 / 天数；
-        // 一天里要放下 blocks.Count 根柱子加它们的间距，反推柱宽并夹在 5~30 之间。
-        // 来源越多柱子越细，而不是挤出卡片 —— 卡片宽度不能跟着接口数量长。
         var barSpacing = S(4);
-        var perDay = ChartUsableWidth / days;
-        var barWidth = Math.Clamp(
-            (perDay - barSpacing * (blocks.Count - 1)) / blocks.Count,
-            S(6), D(30));
+        // 列是星型均分的，所以每天可用的横向空间 = 图表可用宽 / 天数。
+        // 分组：来源越多柱越细；堆叠：一天只有一根，可以宽些。两种都不许挤出卡片右缘
+        // —— 卡片宽度不能跟着接口数量长（卡片横向是不滚动）。
+        var perDay = ChartLayout.PerDayWidth(ChartUsableWidth, days);
+        var barWidth = stacked
+            ? ChartLayout.StackWidth(perDay, D(34), S(10))
+            : ChartLayout.GroupedBarWidth(perDay, blocks.Count, barSpacing, D(30), S(6));
 
         for (var i = 0; i < days; i++)
         {
@@ -413,37 +440,75 @@ public sealed class TokenMeterSpotlightView : UserControl
                 Margin = new Thickness(0, 0, 0, S(2)),
             });
 
-            var barRow = new StackPanel
+            if (stacked)
             {
-                Orientation = Orientation.Horizontal,
-                Spacing = barSpacing,
-                HorizontalAlignment = HorizontalAlignment.Center,
-            };
-            for (var b = 0; b < blocks.Count; b++)
-            {
-                var p = i < blocks[b].Last7.Count ? blocks[b].Last7[i] : null;
-                var tokens = p?.Total ?? 0;
-                var h = tokens > 0 ? Math.Clamp((double)tokens / maxTokens * BarAreaHeight, S(4), BarAreaHeight) : S(2);
+                // 一天一根柱：各来源按 token 折算的厚度从下往上叠，本地块在最底。
+                // StackPanel 是从上往下排的，所以要把来源顺序反过来加，
+                // 否则"本地在下、云端在上"这个读图直觉就是反的。
+                var tokensPerSource = new double[blocks.Count];
+                for (var b = 0; b < blocks.Count; b++)
+                    tokensPerSource[b] = i < blocks[b].Last7.Count ? blocks[b].Last7[i].Total : 0;
+                var heights = ChartLayout.StackHeights(tokensPerSource, scaleTo, BarAreaHeight);
 
-                var track = new Border
+                var segHost = new StackPanel { VerticalAlignment = VerticalAlignment.Bottom };
+                for (var b = blocks.Count - 1; b >= 0; b--)
+                {
+                    if (heights[b] <= 0) continue;   // 0 厚度的段不画：画了会白占一条圆角边
+                    segHost.Children.Add(new Border
+                    {
+                        Height = heights[b],
+                        Width = barWidth,
+                        Background = BarBrushFor(b),
+                        CornerRadius = corner,
+                        VerticalAlignment = VerticalAlignment.Bottom,
+                    });
+                }
+
+                var stackTrack = new Border
                 {
                     Height = BarAreaHeight,
                     Width = barWidth,
                     Background = _barTrackBrush,
                     CornerRadius = corner,
-                    VerticalAlignment = VerticalAlignment.Bottom,
-                    Child = new Border
+                    HorizontalAlignment = HorizontalAlignment.Center,
+                    Child = segHost,
+                };
+                col.Children.Add(new Grid { Height = BarAreaHeight, Children = { stackTrack } });
+            }
+            else
+            {
+                var barRow = new StackPanel
+                {
+                    Orientation = Orientation.Horizontal,
+                    Spacing = barSpacing,
+                    HorizontalAlignment = HorizontalAlignment.Center,
+                };
+                for (var b = 0; b < blocks.Count; b++)
+                {
+                    var p = i < blocks[b].Last7.Count ? blocks[b].Last7[i] : null;
+                    var tokens = p?.Total ?? 0;
+                    var h = ChartLayout.GroupedHeight(tokens, scaleTo, BarAreaHeight, S(4));
+
+                    var track = new Border
                     {
-                        Height = h,
+                        Height = BarAreaHeight,
                         Width = barWidth,
-                        Background = BarBrushFor(b),
+                        Background = _barTrackBrush,
                         CornerRadius = corner,
                         VerticalAlignment = VerticalAlignment.Bottom,
-                    },
-                };
-                barRow.Children.Add(new Grid { Height = BarAreaHeight, Children = { track } });
+                        Child = h > 0 ? new Border
+                        {
+                            Height = h,
+                            Width = barWidth,
+                            Background = BarBrushFor(b),
+                            CornerRadius = corner,
+                            VerticalAlignment = VerticalAlignment.Bottom,
+                        } : null,
+                    };
+                    barRow.Children.Add(new Grid { Height = BarAreaHeight, Children = { track } });
+                }
+                col.Children.Add(barRow);
             }
-            col.Children.Add(barRow);
 
             col.Children.Add(new TextBlock
             {

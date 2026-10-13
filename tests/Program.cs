@@ -28,6 +28,7 @@ internal static class Program
         UndercountTests();
         SplitManyTests();
         RegistryTests();
+        ChartLayoutTests();
         AlertTests();
         DayPointTests();
         IslandLayoutTests();
@@ -411,6 +412,89 @@ internal static class Program
                 fieldLines.Count > 0 && uncommented.Count == 0,
                 $"共 {fieldLines.Count} 行，没说明的：" + string.Join(" | ", uncommented));
         }
+    }
+
+    // ---------------- 近 7 天柱状图几何 ----------------
+
+    /// <summary>
+    /// 卡片横向是<b>不滚动</b>的，所以"来源再多也不许挤出右缘"是硬约束；
+    /// 而堆叠的刻度取错一个（拿单来源最大值当刻度）最高的那根就会顶破柱区。
+    /// 这两件事都能算，就不该等到部署上去用眼睛数。
+    /// </summary>
+    private static void ChartLayoutTests()
+    {
+        Check("堆叠模式认大小写与首尾空格", ChartLayout.NormalizeMode("  Stacked ") == ChartLayout.Stacked, "没认出来");
+        Check("空值、乱填、拼半截都回到分组（默认值），不猜",
+            ChartLayout.NormalizeMode(null) == ChartLayout.Grouped
+            && ChartLayout.NormalizeMode("") == ChartLayout.Grouped
+            && ChartLayout.NormalizeMode("stack") == ChartLayout.Grouped
+            && ChartLayout.NormalizeMode("堆叠") == ChartLayout.Grouped, "回落到别的东西了");
+
+        // 与视图里 ChartUsableWidth 同一个算法：卡片宽 - 左右内边距 - 纵向滚动条留位
+        const double layoutScale = 0.7 * 1.2;
+        const double textScale = 1.15 * 1.2;
+        var usable = 616 * 1.2 - 2 * (30 * layoutScale) - 18 * layoutScale;
+        var perDay = ChartLayout.PerDayWidth(usable, 7);
+        var spacing = 4 * layoutScale;
+        var maxBar = 30 * textScale;
+        var minBar = 6 * layoutScale;
+
+        Check("每列可用宽 = 可用宽 / 天数", Math.Abs(perDay - usable / 7) < 1e-9, $"{perDay}");
+
+        var prev = double.PositiveInfinity;
+        for (var n = 1; n <= 12; n++)
+        {
+            var w = ChartLayout.GroupedBarWidth(perDay, n, spacing, maxBar, minBar);
+            var total = w * n + spacing * (n - 1);
+            // 只有"已经夹到最细下限"时才允许占不满/略超，那是一列实在放不下 N 根柱的情况
+            if (w > minBar + 1e-9 && total > perDay + 1e-6)
+            {
+                Check($"第 {n} 个来源时柱宽不挤出卡片", false, $"w={w:F2} total={total:F2} > perDay={perDay:F2}");
+                return;
+            }
+            if (n > 1 && w > prev + 1e-9)
+            {
+                Check($"来源变多时柱宽不该变粗（n={n}）", false, $"{prev:F2} → {w:F2}");
+                return;
+            }
+            prev = w;
+        }
+        Check("1~12 个来源都装在列宽以内，且柱宽单调不增", true);
+        Check("只有 1 个来源时柱宽取上限（没被算小）",
+            Math.Abs(ChartLayout.GroupedBarWidth(perDay, 1, spacing, maxBar, minBar) - maxBar) < 1e-9,
+            $"{ChartLayout.GroupedBarWidth(perDay, 1, spacing, maxBar, minBar):F2} vs {maxBar:F2}");
+
+        var stackW = ChartLayout.StackWidth(perDay, 34 * textScale, minBar);
+        Check("堆叠只剩一根柱，可以比分组时宽", stackW > ChartLayout.GroupedBarWidth(perDay, 3, spacing, maxBar, minBar),
+            $"stack={stackW:F2}");
+
+        // 堆叠的刻度必须是「各来源相加后」的最大日总量，否则叠起来顶破柱区
+        var seg = ChartLayout.StackHeights(new double[] { 300, 100 }, 400, 170);
+        Check("最高的一天各段相加正好占满柱区（刻度用日总量才对）",
+            Math.Abs(seg[0] + seg[1] - 170) < 1e-9, $"sum={seg[0] + seg[1]}");
+        Check("各段厚度之比等于 token 之比", Math.Abs(seg[0] / seg[1] - 3) < 1e-9, $"{seg[0]}:{seg[1]}");
+
+        var over = ChartLayout.StackHeights(new double[] { 1000 }, 400, 170);
+        Check("单日量超过刻度也不冲出柱区", over[0] <= 170 + 1e-9, $"{over[0]}");
+
+        var withZero = ChartLayout.StackHeights(new double[] { 0, 100 }, 100, 170);
+        Check("当天为 0 的来源厚度 0（不占位、不画出一条细边）",
+            withZero[0] == 0 && Math.Abs(withZero[1] - 170) < 1e-9, $"{withZero[0]}|{withZero[1]}");
+
+        var noData = ChartLayout.StackHeights(new double[] { 5, 5 }, 0, 170);
+        Check("刻度为 0 时全给 0，不能除出 NaN/Infinity",
+            noData.All(h => h == 0), $"got={noData[0]},{noData[1]}");
+
+        Check("分组刻度取单来源最大值：最大那根占满",
+            Math.Abs(ChartLayout.GroupedHeight(400, 400, 170, 5) - 170) < 1e-9 &&
+            Math.Abs(ChartLayout.GroupedHeight(200, 400, 170, 5) - 85) < 1e-9, "分组刻度不对");
+        Check("分组下当天没用量的来源不画柱（0 不是一个小 stub）",
+            ChartLayout.GroupedHeight(0, 400, 170, 5) == 0, "画了个假的细边");
+
+        // 这条不是要求它变好，是把局限写死：别以为换成堆叠就能看见云端那一小条
+        var real = ChartLayout.StackHeights(new double[] { 330_000_000, 24_000 }, 330_024_000, 170);
+        Check("量级差到 10^4 时堆叠下云端那段仍然几乎不可见（这是局限，不是 bug）",
+            real[1] < 0.2, $"实际 {real[1]:F4}px");
     }
 
     // ---------------- 阈值告警（今日预算 / 余额预警） ----------------

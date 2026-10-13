@@ -23,5 +23,6 @@
     <Compile Include="..\ProviderClient.cs" />
     <Compile Include="..\Reconcile.cs" />
     <Compile Include="..\Sources.cs" />
+    <Compile Include="..\Chart.cs" />
   </ItemGroup>
 </Project>

@@ -43,6 +43,10 @@ public sealed class TokenMeterPlugin : IslandPluginBase
     private List<ProviderConfig> _providers = new();
     private DateTime _providersStamp = DateTime.MinValue;
 
+    /// <summary>近 7 天图的画法。缓化成字段：ComposeSnapshot 在后台线程跑，
+    /// 而后台线程读宿主设置是这类插件出 COMException 的经典位置，所以只在调用线程读一次。</summary>
+    private string _chartMode = ChartLayout.Grouped;
+
     private readonly SemaphoreSlim _gate = new(1, 1);
     private CancellationTokenSource _cts = new();
     private bool _stopped;
@@ -89,6 +93,12 @@ public sealed class TokenMeterPlugin : IslandPluginBase
         Context.Register(Context.OnSettingsChanged("roots", () => _ = RefreshAsync("数据目录变更")));
         Context.Register(Context.OnSettingsChanged("localScope", () => RecomputeFromLedger("模型归属变更")));
         Context.Register(Context.OnSettingsChanged("localBudget", () => RecomputeFromLedger("本地预算变更")));
+        Context.Register(Context.OnSettingsChanged("chartMode", () =>
+        {
+            // 这里在 UI 线程的设置回调里，读设置是安全的；刷新那条路径才需要缓存成字段
+            _chartMode = ChartLayout.NormalizeMode(Settings.Get("chartMode", ChartLayout.Grouped));
+            RecomputeFromLedger("图表画法变更");
+        }));
         // provider 键不再监听：接口配置已搬到 providers.json，由心跳查文件变化
         Context.Register(Context.OnSettingsChanged("refreshSeconds", () => { _secondsSinceRefresh = 0; }));
 
@@ -194,6 +204,7 @@ public sealed class TokenMeterPlugin : IslandPluginBase
             // 真正的取数入口重新读设置，不用初始化时缓存的字段（§15.1）
             var rootsText = Settings.Get("roots", string.Empty);
             var pricingJson = Settings.Get("pricing", string.Empty);
+            _chartMode = ChartLayout.NormalizeMode(Settings.Get("chartMode", ChartLayout.Grouped));
             var roots = UsageScanner.ResolveRoots(rootsText);
             var pricing = PricingConfig.Parse(pricingJson);
             var token = _cts.Token;
@@ -451,6 +462,7 @@ public sealed class TokenMeterPlugin : IslandPluginBase
                 : (providers.Any(p => p.Enabled) ? "已启用的接口本轮没有可用数据" : "服务端接口未启用"),
             CoveredUntilUtc = CoveredFloor(live),
             ProviderNote = note,
+            ChartMode = _chartMode,
             SplitWarning = live.Count > 0 ? splitWarning : string.Empty,
             ServerUndercount = undercount,
             UndercountDetail = undercountDetail,
@@ -732,6 +744,7 @@ public sealed class TokenMeterPlugin : IslandPluginBase
                 ? new Snapshot { Currency = pricing.Currency, Error = error }
                 : SnapshotBuilder.Build(_lastLedger, pricing);
             if (string.IsNullOrEmpty(snap.Error)) snap.Error = error;
+            snap.ChartMode = _chartMode;
             return snap;
         }
     }
@@ -946,6 +959,28 @@ public sealed class TokenMeterPlugin : IslandPluginBase
             if (e.Key == Windows.System.VirtualKey.Enter) CommitLocalBudget(localBudgetBox);
         };
         page.Children.Add(Card(localBudgetBox));
+
+        // ---- 近 7 天图的画法 ----
+        // 顺序很关键：先把项加满、把当前选中位置写好，**最后**才挂 SelectionChanged。
+        // 程序性赋值会触发这个事件（同一个坑在接口选择器上踩过一次，那次是 StackOverflow 直接杀死宿主）
+        var chartBox = new ComboBox
+        {
+            Header = "近 7 天柱状图",
+            MinWidth = 300,
+            HorizontalAlignment = HorizontalAlignment.Left,
+        };
+        chartBox.Items.Add("分组（一个来源一根柱，并排）");
+        chartBox.Items.Add("堆叠（一天一根柱，按来源叠色）");
+        chartBox.SelectedIndex = ChartLayout.NormalizeMode(Settings.Get("chartMode", ChartLayout.Grouped))
+                                 == ChartLayout.Stacked ? 1 : 0;
+        chartBox.SelectionChanged += (_, _) =>
+        {
+            var mode = chartBox.SelectedIndex == 1 ? ChartLayout.Stacked : ChartLayout.Grouped;
+            if (string.Equals(Settings.Get("chartMode", ChartLayout.Grouped), mode, StringComparison.Ordinal)) return;
+            Settings.Set("chartMode", mode);
+            Status($"近 7 天图已改为「{(mode == ChartLayout.Stacked ? "堆叠" : "分组")}」");
+        };
+        page.Children.Add(Card(chartBox));
 
         // ---- 货币符号 + 单价基数 ----
         var currencyBox = new TextBox
