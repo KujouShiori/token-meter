@@ -49,7 +49,9 @@ public sealed class TokenMeterPlugin : IslandPluginBase
     /// <summary>后台是否在拉取中，用来给设置页按钮做即时反馈。</summary>
     public event Action<bool>? BusyChanged;
 
-    private string _lastProviderNote = string.Empty;
+    /// <summary>每个接口各自的「上一次失败原因」：日志去重与恢复提示都要按接口分开算，
+    /// 否则 A 家正常会把 B 家的告警当成"已恢复"。</summary>
+    private readonly Dictionary<string, string> _lastProviderNotes = new(StringComparer.Ordinal);
 
     protected override Task OnInitializeAsync()
     {
@@ -185,6 +187,8 @@ public sealed class TokenMeterPlugin : IslandPluginBase
             // 接口列表必须在调用线程读：LoadProviders 里要碰宿主设置，
             // 而后台线程读设置是这类插件出 COMException 的经典位置（原来也是「外面读、里面解析」）
             var providers = LoadProviders();
+            // 被删掉的接口不能留下孤儿账本：状态文件会一直涨，而且再也无人去读它
+            _states.DropOrphans(providers.Select(p => p.Id));
             try
             {
                 snap = await Task.Run(async () =>
@@ -195,48 +199,51 @@ public sealed class TokenMeterPlugin : IslandPluginBase
                     var local = _scanner.Scan(roots, token);
                     if (!_stopped) _scanner.SaveCache();
 
-                    var cfg = providers[0];
-                    if (!cfg.Enabled)
+                    var active = providers.Where(p => p.Enabled).ToList();
+                    if (active.Count == 0)
                     {
-                        // 用户主动关掉接口：不能拿旧的服务端数据去压制本地日志
-                        _serverLedgers.Remove(cfg.Id);
-                        _coveredUntil.Remove(cfg.Id);
+                        // 用户把所有接口都关了：不能拿旧的服务端数据去压制本地日志
+                        _serverLedgers.Clear();
+                        _coveredUntil.Clear();
                     }
 
                     // 先把本地结果立即上屏：接口慢、卡住或在翻页时，界面也不会空着等你。
                     // 这里必须走多来源合成：否则这一帧只有本地一块，
                     // 双柱图与云端 KPI 栏会在每次刷新中途闪没一下（已发生过）。
-                    RunOnUI(() => Apply(ComposeSnapshot(local, pricing, cfg, "云端拉取中…")));
+                    RunOnUI(() => Apply(ComposeSnapshot(local, pricing, providers, "云端拉取中…")));
 
-                    var note = string.Empty;
-                    if (cfg.Enabled)
+                    // 逐个接口独立成败：一家挂了不能连累其它家，也不能让整轮拿不到数
+                    var notes = new List<string>();
+                    foreach (var cfg in active)
                     {
-                        if (cfg.IsUsable(out var why))
+                        token.ThrowIfCancellationRequested();
+
+                        if (!cfg.IsUsable(out var why))
                         {
-                            try
-                            {
-                                await PullProviderAsync(cfg, token).ConfigureAwait(false);
-                            }
-                            catch (OperationCanceledException) { throw; }
-                            catch (ProviderException ex)
-                            {
-                                note = "接口不可用，已降级本地日志：" + ex.Message;
-                                RememberProviderFailure(cfg.Id, note);
-                            }
-                            catch (Exception ex)
-                            {
-                                note = "接口异常，已降级本地日志：" + ex.Message;
-                                RememberProviderFailure(cfg.Id, note);
-                            }
+                            notes.Add($"{cfg.DisplayName}：接口未就绪（{why}）");
+                            RememberProviderFailure(cfg.Id, $"{cfg.DisplayName} 接口未就绪（已降级本地日志）：{why}");
+                            continue;
                         }
-                        else
+
+                        try
                         {
-                            note = "接口未就绪（已降级本地日志）：" + why;
-                            RememberProviderFailure(cfg.Id, note);
+                            await PullProviderAsync(cfg, token).ConfigureAwait(false);
+                            ClearProviderFailure(cfg.Id);
+                        }
+                        catch (OperationCanceledException) { throw; }
+                        catch (ProviderException ex)
+                        {
+                            notes.Add($"{cfg.DisplayName}：接口不可用，已降级本地日志（{ex.Message}）");
+                            RememberProviderFailure(cfg.Id, $"{cfg.DisplayName} 接口不可用：{ex.Message}");
+                        }
+                        catch (Exception ex)
+                        {
+                            notes.Add($"{cfg.DisplayName}：接口异常，已降级本地日志（{ex.Message}）");
+                            RememberProviderFailure(cfg.Id, $"{cfg.DisplayName} 接口异常：{ex.Message}");
                         }
                     }
 
-                    var s = ComposeSnapshot(local, pricing, cfg, note);
+                    var s = ComposeSnapshot(local, pricing, providers, string.Join(" ; ", notes));
                     lock (_ledgerLock) { _lastLedger = local; }
                     return s;
                 }, token).ConfigureAwait(false);
@@ -284,45 +291,77 @@ public sealed class TokenMeterPlugin : IslandPluginBase
         }
     }
 
+    /// <summary>多接口时取最早的那个水位线：云端数据只可信到「最落后的那家也拉完」为止。
+    /// 取最大值会虚报覆盖范围，让本地日志在还没同步的区间上被误当成已核对过。</summary>
+    private DateTime? CoveredFloor(IReadOnlyList<ProviderConfig> live)
+    {
+        DateTime? min = null;
+        foreach (var p in live)
+        {
+            var c = _coveredUntil.GetValueOrDefault(p.Id);
+            if (c is null) continue;
+            if (min is null || c < min) min = c;
+        }
+        return min;
+    }
+
     /// <summary>
-    /// 把本地账本与云端账本算成【分列的两块】。两个运营商的用量不相交、币种也不同，
-    /// 所以绝不合并相加；只有被云端声明的模型才从本地剔出去（避免同一模型算两遍）。
+    /// 把本地账本与各接口账本算成【分列的多块】。不同运营商的用量不相交、币种也不同，
+    /// 所以绝不合并相加；只有被某个接口认领的模型才从本地剔出去（避免同一模型算两遍）。
+    /// Blocks[0] 正常就是本地块 —— 视图拿主块显示岛面标题。
     /// </summary>
-    private Snapshot ComposeSnapshot(UsageLedger local, PricingConfig pricing, ProviderConfig cfg, string note)
+    private Snapshot ComposeSnapshot(UsageLedger local, PricingConfig pricing, IReadOnlyList<ProviderConfig> providers, string note)
     {
         var blocks = new List<SourceBlock>();
         var splitNote = string.Empty;
         var splitWarning = string.Empty;
         var undercount = false;
         var undercountDetail = string.Empty;
-        var haveServer = cfg.Enabled && _serverLedgers.TryGetValue(cfg.Id, out var serverLedger) && serverLedger.Days.Count > 0;
+
+        // 只有「启用了且真的拿到数据」的接口才参与认领：空账本参与的话，
+        // 一个还没拉通的接口会把模型从本地剔走，让数字凭空消失
+        var live = providers
+            .Where(p => p.Enabled && _serverLedgers.ContainsKey(p.Id) && _serverLedgers[p.Id].Days.Count > 0)
+            .ToList();
 
         SourceBlock primary;
-        if (haveServer)
+        if (live.Count > 0)
         {
-            var (localPart, serverPart, split) = LedgerSplitter.Split(
-                local, _serverLedgers[cfg.Id],
-                ModelScope.Parse(Settings.Get("localScope", string.Empty)),
-                ModelScope.Parse(cfg.ModelScope),
-                _coveredUntil.GetValueOrDefault(cfg.Id), cfg.UndercountWarnPercent);
+            var tuples = new List<(string, string, UsageLedger, ModelScope, DateTime?, int)>(live.Count);
+            foreach (var p in live)
+                tuples.Add((p.Id, p.DisplayName, _serverLedgers[p.Id],
+                    ModelScope.Parse(p.ModelScope), _coveredUntil.GetValueOrDefault(p.Id), p.UndercountWarnPercent));
 
-            // 云端用自己的币种；没拿到 quota 的模型仍回退到本地单价估算
-            var serverPricing = PricingConfig.Parse(pricing.ToJson());
-            serverPricing.Currency = string.IsNullOrWhiteSpace(cfg.Currency) ? "$" : cfg.Currency.Trim();
+            var (localPart, assigned, split) = LedgerSplitter.SplitMany(local, tuples,
+                ModelScope.Parse(Settings.Get("localScope", string.Empty)));
 
             var lb = SnapshotBuilder.BuildBlock(localPart, pricing, "本地日志");
-            var sb = SnapshotBuilder.BuildBlock(serverPart, serverPricing, cfg.DisplayName);
             blocks.Add(lb);
-            blocks.Add(sb);
-            MaybeLogReconcileSample(sb, cfg);
+
+            for (var i = 0; i < live.Count; i++)
+            {
+                // 每个接口用自己的币种；没报回金额的模型仍回退到本地单价估算
+                var serverPricing = PricingConfig.Parse(pricing.ToJson());
+                serverPricing.Currency = string.IsNullOrWhiteSpace(live[i].Currency) ? "$" : live[i].Currency.Trim();
+
+                var sb = SnapshotBuilder.BuildBlock(assigned[i].Ledger, serverPricing, live[i].DisplayName);
+                blocks.Add(sb);
+                MaybeLogReconcileSample(sb, live[i]);
+            }
+
             splitNote = split.Note;
             splitWarning = split.DroppedNote;
             undercount = split.Undercount;
             undercountDetail = split.UndercountDetail;
-            // 告警走 ProviderNote 通道：状态行与聚光卡都读它，不必再开第三个显示位
+
+            // 冲突与低估值都走 ProviderNote（状态行与聚光卡都读它）。
+            // 冲突尤其必须报出来：那些模型谁都没认领，用户不去设范围就永远少一块云端数
+            if (!string.IsNullOrEmpty(split.ConflictNote))
+                note = string.IsNullOrEmpty(note) ? split.ConflictNote : note + "；" + split.ConflictNote;
             if (split.Undercount)
                 note = string.IsNullOrEmpty(note) ? split.UndercountDetail : note + "；" + split.UndercountDetail;
-            primary = lb.HasData ? lb : sb;
+
+            primary = lb.HasData ? lb : blocks[1];
         }
         else
         {
@@ -338,11 +377,15 @@ public sealed class TokenMeterPlugin : IslandPluginBase
             ScannedBytes = local.ScannedBytes,
             Blocks = blocks,
             SplitNote = splitNote,
-            SourceMode = haveServer ? "本地 + 云端（分列）" : "本地日志",
-            ProviderSummary = cfg.Enabled ? cfg.SafeSummary() : "服务端接口未启用",
-            CoveredUntilUtc = haveServer ? _coveredUntil.GetValueOrDefault(cfg.Id) : null,
+            SourceMode = live.Count > 0
+                ? (live.Count == 1 ? "本地 + 云端（分列）" : $"本地 + {live.Count} 个云端（分列）")
+                : "本地日志",
+            ProviderSummary = live.Count > 0
+                ? string.Join(" ｜ ", live.Select(p => p.SafeSummary()))
+                : (providers.Any(p => p.Enabled) ? "已启用的接口本轮没有可用数据" : "服务端接口未启用"),
+            CoveredUntilUtc = CoveredFloor(live),
             ProviderNote = note,
-            SplitWarning = haveServer ? splitWarning : string.Empty,
+            SplitWarning = live.Count > 0 ? splitWarning : string.Empty,
             ServerUndercount = undercount,
             UndercountDetail = undercountDetail,
         };
@@ -401,19 +444,12 @@ public sealed class TokenMeterPlugin : IslandPluginBase
         st.ServerTotalTokens = merged.TotalTokens();
         SaveStates();
 
-        // 上一轮失败、本轮成功：补一条恢复日志（失败那边的重复告警已做去重）
-        if (!string.IsNullOrEmpty(_lastProviderNote))
-        {
-            Log.Info("接口已恢复，上一轮问题：" + _lastProviderNote);
-            _lastProviderNote = string.Empty;
-        }
-
         Log.Info($"服务端用量拉取完成：{windows} 段 / {pages} 页 / {Format.Bytes(bytes)}"
                + (hitBudget ? $"（本轮接口预算 {cfg.ProviderBudgetSeconds}s 用完，剩余窗口下轮继续）" : string.Empty)
                + $"，水位线推到 {advanced:yyyy-MM-dd HH:mm}Z，累计 {Format.Tokens(st.ServerTotalTokens)} token");
     }
 
-    private DateTime? _lastReconcileLogUtc;
+    private readonly Dictionary<string, DateTime> _lastReconcileLogUtc = new(StringComparer.Ordinal);
 
     /// <summary>
     /// 对账辅助输出：把云端块最近若干天的「按单价推算费用」与「接口上报金额」并排写进日志。
@@ -426,8 +462,8 @@ public sealed class TokenMeterPlugin : IslandPluginBase
         if (!serverBlock.HasData || serverBlock.Last7.Count == 0) return;
 
         var nowUtc = DateTime.UtcNow;
-        if (_lastReconcileLogUtc is not null && nowUtc - _lastReconcileLogUtc.Value < TimeSpan.FromMinutes(30)) return;
-        _lastReconcileLogUtc = nowUtc;
+        if (_lastReconcileLogUtc.TryGetValue(cfg.Id, out var lastLog) && nowUtc - lastLog < TimeSpan.FromMinutes(30)) return;
+        _lastReconcileLogUtc[cfg.Id] = nowUtc;
 
         var cur = string.IsNullOrWhiteSpace(cfg.Currency) ? "$" : cfg.Currency.Trim();
         var lines = new List<string>();
@@ -462,23 +498,38 @@ public sealed class TokenMeterPlugin : IslandPluginBase
         SaveStates();
 
         // 同一个原因每分钟刷一条 WARN 会把日志埋掉（实测 121 条）：只在原因变化时记
-        if (string.Equals(note, _lastProviderNote, StringComparison.Ordinal)) return;
-        _lastProviderNote = note;
-        Log.Warn(note + "（保留上一次服务端数据，并继续用本地日志兜底）");
+        if (_lastProviderNotes.TryGetValue(id, out var last) && string.Equals(note, last, StringComparison.Ordinal)) return;
+        _lastProviderNotes[id] = note;
+        Log.Warn(note + "（保留该接口上一次的服务端数据，并继续用本地日志兜底）");
+    }
+
+    /// <summary>本轮这个接口成功了：只在它之前确实报过故障时补一条恢复日志。
+    /// 恢复提示必须按接口算 —— 否则 A 家正常会把 B 家的告警误报成"已恢复"。</summary>
+    private void ClearProviderFailure(string id)
+    {
+        if (!_lastProviderNotes.TryGetValue(id, out var last)) return;
+        _lastProviderNotes.Remove(id);
+        Log.Info("接口已恢复，上一轮问题：" + last);
     }
 
     private void OnProviderConfigChanged()
     {
-        var cfg = LoadProviders()[0];
-        if (!cfg.Enabled)
+        var providers = LoadProviders();
+        var dropped = false;
+
+        // 逐个接口判断：关掉某一个只能丢它自己的服务端数据，不能顺手把别家也清了
+        foreach (var p in providers.Where(x => !x.Enabled))
         {
-            // 关掉接口就不能再拿旧的服务端数据压制本地日志
-            _serverLedgers.Remove(cfg.Id);
-            _coveredUntil.Remove(cfg.Id);
-            _states.For(cfg.Id).CoveredUntilUtc = null;
-            SaveStates();
-            Log.Info("服务端接口已关闭，回到纯本地日志模式");
+            if (_serverLedgers.Remove(p.Id) | _coveredUntil.Remove(p.Id)) dropped = true;
+            _states.For(p.Id).CoveredUntilUtc = null;
         }
+
+        if (dropped)
+        {
+            SaveStates();
+            Log.Info("有接口被关闭：它那份服务端数据不再参与合并，这部分回到本地日志兜底");
+        }
+
         _ = RefreshAsync("接口配置变更");
     }
 
@@ -543,7 +594,6 @@ public sealed class TokenMeterPlugin : IslandPluginBase
     private void RecomputeFromLedger(string reason)
     {
         var pricing = PricingConfig.Parse(Settings.Get("pricing", string.Empty));
-        var cfg = LoadProviders()[0];
         UsageLedger? local;
         lock (_ledgerLock) { local = _lastLedger; }
 
@@ -553,7 +603,7 @@ public sealed class TokenMeterPlugin : IslandPluginBase
             return;
         }
 
-        var snap = ComposeSnapshot(local, pricing, cfg, string.Empty);
+        var snap = ComposeSnapshot(local, pricing, LoadProviders(), string.Empty);
         Log.Info($"重算快照（{reason}）：今日 {Format.Amount(snap.Today.Cost)}{snap.Currency}，{snap.Blocks.Count} 个来源");
         RunOnUI(() => Apply(snap));
     }
