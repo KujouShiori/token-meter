@@ -186,12 +186,13 @@ internal static class Program
 
         var covered = EndOfDayUtc("2026-10-01");
 
+        // 两个接口各报不同模型：互不干扰，本地把两个都让出去
         var local2 = Ledger(("2026-10-01", "glm-4", 1000), ("2026-10-01", "kimi-k2", 2000));
         var (l2, a2, i2) = LedgerSplitter.SplitMany(local2,
             new[]
             {
-                ("A", Ledger(("2026-10-01", "glm-4", 1100)), ModelScope.Empty, (DateTime?)covered, 0),
-                ("B", Ledger(("2026-10-01", "kimi-k2", 2100)), ModelScope.Empty, (DateTime?)covered, 0),
+                ("A", "网关A", Ledger(("2026-10-01", "glm-4", 1100)), ModelScope.Empty, (DateTime?)covered, 0),
+                ("B", "网关B", Ledger(("2026-10-01", "kimi-k2", 2100)), ModelScope.Empty, (DateTime?)covered, 0),
             },
             ModelScope.Empty);
         Check("A 拿到自己报的模型", a2[0].Ledger.Days["2026-10-01"]["glm-4"].Total == 1100, "A");
@@ -199,42 +200,72 @@ internal static class Program
         Check("两个模型都从本地剔走", l2.Days.Count == 0, $"local days={l2.Days.Count}");
         Check("无冲突时不写冲突说明", i2.Conflicts.Count == 0 && string.IsNullOrEmpty(i2.ConflictNote), i2.ConflictNote);
 
+        // 同一模型被两个接口都报：禁止重叠 —— 谁都不给，回落到本地，并点名报出冲突
         var (_, a3, i3) = LedgerSplitter.SplitMany(Ledger(("2026-10-01", "glm-4", 1000)),
             new[]
             {
-                ("A", Ledger(("2026-10-01", "glm-4", 1100)), ModelScope.Empty, (DateTime?)covered, 0),
-                ("B", Ledger(("2026-10-01", "glm-4", 9999)), ModelScope.Empty, (DateTime?)covered, 0),
+                ("A", "网关A", Ledger(("2026-10-01", "glm-4", 1100)), ModelScope.Empty, (DateTime?)covered, 0),
+                ("B", "网关B", Ledger(("2026-10-01", "glm-4", 9999)), ModelScope.Empty, (DateTime?)covered, 0),
             },
             ModelScope.Empty);
-        Check("重叠模型只归第一个接口", a3[0].Ledger.Days["2026-10-01"]["glm-4"].Total == 1100, "A");
-        Check("第二个接口没拿到重叠模型", !a3[1].Ledger.Days.ContainsKey("2026-10-01"), "B 不该有数");
-        Check("重叠被记进冲突清单", i3.Conflicts.Contains("glm-4"), string.Join(",", i3.Conflicts));
-        Check("冲突说明非空：不能静默少一块数字", !string.IsNullOrEmpty(i3.ConflictNote), "empty");
         var sum3 = a3.Sum(a => a.Ledger.TotalTokens());
-        Check("重叠模型不会被算两遍", sum3 == 1100, $"sum={sum3}");
+        Check("重叠模型两个接口都不拿", sum3 == 0, $"sum={sum3}");
+        Check("重叠被记进冲突清单", i3.Conflicts.Contains("glm-4"), string.Join(",", i3.Conflicts));
+        Check("冲突说明点名了模型", i3.ConflictNote.Contains("glm-4"), i3.ConflictNote);
+        Check("冲突说明点名了涉及的两个接口",
+            i3.ConflictNote.Contains("网关A") && i3.ConflictNote.Contains("网关B"), i3.ConflictNote);
+        Check("冲突模型回落到本地块：数字不会凭空消失",
+            i3.MovedToServer.Count == 0, string.Join(",", i3.MovedToServer));
 
+        var (l3b, _, _) = LedgerSplitter.SplitMany(Ledger(("2026-10-01", "glm-4", 1000)),
+            new[]
+            {
+                ("A", "网关A", Ledger(("2026-10-01", "glm-4", 1100)), ModelScope.Empty, (DateTime?)covered, 0),
+                ("B", "网关B", Ledger(("2026-10-01", "glm-4", 9999)), ModelScope.Empty, (DateTime?)covered, 0),
+            },
+            ModelScope.Empty);
+        Check("冲突模型确实留在本地块里", l3b.Days["2026-10-01"]["glm-4"].Total == 1000, "没留本地");
+
+        // 三接口里只有一对冲突，第三个不受牵连
+        var (_, a3c, i3c) = LedgerSplitter.SplitMany(Ledger(("2026-10-01", "glm-4", 100)),
+            new[]
+            {
+                ("A", "网关A", Ledger(("2026-10-01", "glm-4", 1100)), ModelScope.Empty, (DateTime?)covered, 0),
+                ("B", "网关B", Ledger(("2026-10-01", "glm-4", 9999)), ModelScope.Empty, (DateTime?)covered, 0),
+                ("C", "网关C", Ledger(("2026-10-01", "deepseek-v4", 500)), ModelScope.Empty, (DateTime?)covered, 0),
+            },
+            ModelScope.Empty);
+        Check("不冲突的第三个接口照常拿到自己的模型",
+            a3c[2].Ledger.Days["2026-10-01"]["deepseek-v4"].Total == 500, "C");
+        Check("只把真正重叠的那个模型标成冲突",
+            i3c.Conflicts.Count == 1 && i3c.Conflicts[0] == "glm-4", string.Join(",", i3c.Conflicts));
+
+        // 同一接口跨天报同一模型，不能被误判成冲突
         var multiDay = Ledger(("2026-10-01", "glm-4", 100), ("2026-10-02", "glm-4", 200));
         var (_, a4, i4) = LedgerSplitter.SplitMany(Ledger(),
-            new[] { ("A", multiDay, ModelScope.Empty, (DateTime?)null, 0) }, ModelScope.Empty);
+            new[] { ("A", "网关A", multiDay, ModelScope.Empty, (DateTime?)null, 0) }, ModelScope.Empty);
         Check("同一接口跨天报同一模型不算冲突", i4.Conflicts.Count == 0, string.Join(",", i4.Conflicts));
         Check("跨天的两天都进了该接口账本", a4[0].Ledger.Days.Count == 2, $"days={a4[0].Ledger.Days.Count}");
 
-        var (_, a5, _) = LedgerSplitter.SplitMany(Ledger(),
+        // 各接口的模型范围独立生效；范围不匹配的不算进「想要」，因此也不构成冲突
+        var (_, a5, i5) = LedgerSplitter.SplitMany(Ledger(),
             new[]
             {
-                ("A", Ledger(("2026-10-01", "glm-4", 100)), ModelScope.Parse("glm-"), (DateTime?)covered, 0),
-                ("B", Ledger(("2026-10-01", "glm-4", 700)), ModelScope.Parse("kimi"), (DateTime?)covered, 0),
+                ("A", "网关A", Ledger(("2026-10-01", "glm-4", 100)), ModelScope.Parse("glm-"), (DateTime?)covered, 0),
+                ("B", "网关B", Ledger(("2026-10-01", "glm-4", 700)), ModelScope.Parse("kimi"), (DateTime?)covered, 0),
             },
             ModelScope.Empty);
         Check("范围不匹配的接口拿不到该模型", !a5[1].Ledger.Days.ContainsKey("2026-10-01"), "B scope");
         Check("范围匹配的接口照常拿到", a5[0].Ledger.Days["2026-10-01"]["glm-4"].Total == 100, "A scope");
+        Check("被范围挡掉的不算重叠", i5.Conflicts.Count == 0, string.Join(",", i5.Conflicts));
 
+        // 低估值逐接口判定
         var uLocal = Ledger(("2026-10-01", "glm-4", 1000), ("2026-10-01", "kimi-k2", 1000));
         var (_, a6, i6) = LedgerSplitter.SplitMany(uLocal,
             new[]
             {
-                ("A", Ledger(("2026-10-01", "glm-4", 300)), ModelScope.Empty, (DateTime?)covered, 10),
-                ("B", Ledger(("2026-10-01", "kimi-k2", 1000)), ModelScope.Empty, (DateTime?)covered, 10),
+                ("A", "网关A", Ledger(("2026-10-01", "glm-4", 300)), ModelScope.Empty, (DateTime?)covered, 10),
+                ("B", "网关B", Ledger(("2026-10-01", "kimi-k2", 1000)), ModelScope.Empty, (DateTime?)covered, 10),
             },
             ModelScope.Empty);
         Check("报少的接口被单独标低估值", a6[0].Undercount, "A");

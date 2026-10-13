@@ -106,7 +106,7 @@ public static class LedgerSplitter
         DateTime? coveredUntilUtc = null, int undercountWarnPercent = 0)
     {
         var (localOut, assigned, info) = SplitMany(local,
-            new[] { ("", server, providerScope, coveredUntilUtc, undercountWarnPercent) }, localScope);
+            new[] { ("", "", server, providerScope, coveredUntilUtc, undercountWarnPercent) }, localScope);
         return (localOut, assigned.Count > 0 ? assigned[0].Ledger : new UsageLedger(), info);
     }
 
@@ -114,19 +114,23 @@ public static class LedgerSplitter
     public sealed class Assignment
     {
         public string Id { get; set; } = "";
+        /// <summary>接口显示名，只用于把冲突点名说清楚。</summary>
+        public string Name { get; set; } = "";
         public UsageLedger Ledger { get; set; } = new();
         public bool Undercount { get; set; }
         public string UndercountDetail { get; set; } = "";
     }
 
     /// <summary>
-    /// N 个接口的归属分派。规则与单接口一致，只多两件事：
-    /// **先到先得** —— 同一个模型被两个接口都上报时只归前者，否则那笔量会被算两遍；
-    /// 让掉的那个接口所报的模型名要记进 Conflicts，绝不能让某一块数字静默变少。
+    /// N 个接口的归属分派。规则与单接口一致，只多一条：**禁止重叠**。
+    /// 同一个模型被两个以上接口同时上报时谁都不归 —— 归属不能靠接口排列顺序猜，
+    /// 「先到先得」看起来数字正常，其实换一下顺序结果就变了。
+    /// 冲突的模型回落到本地日志（对它是无歧义的来源），并把涉及方点名报出来：
+    /// 既不双计，也不让哪块数字静默消失。
     /// </summary>
     public static (UsageLedger Local, List<Assignment> Assigned, SplitInfo Info) SplitMany(
         UsageLedger local,
-        IReadOnlyList<(string Id, UsageLedger Server, ModelScope Scope, DateTime? CoveredUntilUtc, int WarnPercent)> providers,
+        IReadOnlyList<(string Id, string Name, UsageLedger Server, ModelScope Scope, DateTime? CoveredUntilUtc, int WarnPercent)> providers,
         ModelScope localScope)
     {
         var info = new SplitInfo();
@@ -141,8 +145,28 @@ public static class LedgerSplitter
         var claimedByAnyone = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var assigned = new List<Assignment>();
 
-        foreach (var p in providers)
+        // 第一遍：每个接口按自己的范围「想要」哪些模型，并数出每个模型被几个接口上报。
+        // 必须先数完再分派，否则第二个接口只能靠顺序决定归属。
+        var wants = new List<HashSet<string>>(providers.Count);
+        var reporters = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        for (var i = 0; i < providers.Count; i++)
         {
+            var scope = providers[i].Scope;
+            var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var byModel in providers[i].Server.Days.Values)
+                foreach (var model in byModel.Keys)
+                    if (scope.IsEmpty || scope.Matches(model)) set.Add(model);
+            wants.Add(set);
+            foreach (var m in set) reporters[m] = reporters.GetValueOrDefault(m) + 1;
+        }
+
+        foreach (var kv in reporters)
+            if (kv.Value > 1 && !info.Conflicts.Contains(kv.Key, StringComparer.OrdinalIgnoreCase))
+                info.Conflicts.Add(kv.Key);
+
+        for (var i = 0; i < providers.Count; i++)
+        {
+            var p = providers[i];
             var mine = new UsageLedger { RootDescription = p.Server.RootDescription };
             var mineClaimed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
@@ -150,24 +174,15 @@ public static class LedgerSplitter
             {
                 foreach (var (model, c) in byModel)
                 {
-                    if (!p.Scope.IsEmpty && !p.Scope.Matches(model)) continue;
-
-                    if (!mineClaimed.Contains(model))
-                    {
-                        if (claimedByAnyone.Contains(model))
-                        {
-                            if (!info.Conflicts.Contains(model, StringComparer.OrdinalIgnoreCase))
-                                info.Conflicts.Add(model);
-                            continue;   // 已被前面的接口认领，再收下就是算两遍
-                        }
-                        claimedByAnyone.Add(model);
-                        mineClaimed.Add(model);
-                    }
+                    if (!wants[i].Contains(model)) continue;
+                    if (reporters[model] > 1) continue;   // 重叠：谁都不给，留给本地块
                     mine.Add(dayKey, model, c);
+                    mineClaimed.Add(model);
+                    claimedByAnyone.Add(model);
                 }
             }
 
-            var a = new Assignment { Id = p.Id, Ledger = mine };
+            var a = new Assignment { Id = p.Id, Name = p.Name, Ledger = mine };
             (a.Undercount, a.UndercountDetail) = DetectUndercount(
                 local, mine, mineClaimed, p.CoveredUntilUtc, p.WarnPercent);
             assigned.Add(a);
@@ -207,8 +222,20 @@ public static class LedgerSplitter
             info.DroppedNote = $"本地范围未包含这些模型，两边都没统计：{string.Join("、", info.DroppedByLocalScope)}";
 
         if (info.Conflicts.Count > 0)
-            info.ConflictNote = "这些模型被多个接口同时上报，只归了第一个，其余接口里的这部分数据已丢弃："
-                + string.Join("、", info.Conflicts);
+        {
+            var involved = new List<string>();
+            for (var i = 0; i < providers.Count; i++)
+            {
+                var name = string.IsNullOrWhiteSpace(providers[i].Name) ? $"第 {i + 1} 个接口" : providers[i].Name;
+                if (info.Conflicts.Any(c => wants[i].Contains(c)) && !involved.Contains(name)) involved.Add(name);
+            }
+
+            info.ConflictNote = "以下模型被多个接口同时上报，无法判定该归谁，已一个都不认、改由本地日志显示："
+                + string.Join("、", info.Conflicts)
+                + $"（涉及接口：{string.Join("、", involved)}）。"
+                + "请给其中一个接口的「云端统计哪些模型」设范围把它排除，"
+                + "否则这部分云端用量不会被计入。";
+        }
 
         var bad = assigned.Where(a => a.Undercount).ToList();
         if (bad.Count > 0)
