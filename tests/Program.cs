@@ -27,6 +27,7 @@ internal static class Program
         ScannerTests();
         UndercountTests();
         SplitManyTests();
+        RegistryTests();
 
         Console.WriteLine($"[Program] {_pass} 过 / {_fail} 败");
         var providerFailures = await ProviderTests.RunAsync();
@@ -239,5 +240,57 @@ internal static class Program
         Check("报少的接口被单独标低估值", a6[0].Undercount, "A");
         Check("报足的接口不被连带误标", !a6[1].Undercount, "B");
         Check("整体告警位为真且带出差值", i6.Undercount && i6.UndercountDetail.Contains("少 70%"), i6.UndercountDetail);
+    }
+
+    // ---------------- 存储层迁移 ----------------
+
+    private static void RegistryTests()
+    {
+        Console.WriteLine("== 接口配置存储 ==");
+
+        var empty = ProviderRegistry.Parse(null);
+        Check("空配置是空列表，不算解析失败", empty is not null && empty.Items.Count == 0, "empty");
+
+        var legacy = "{\"Enabled\":true,\"DisplayName\":\"我的网关\",\"BaseUrl\":\"https://x.example\","
+            + "\"Path\":\"/api/log/self\",\"ModelScope\":\"deepseek-\",\"Currency\":\"$\"}";
+        var l1 = ProviderRegistry.Parse(legacy);
+        Check("旧的单对象形态被包成一条", l1 is not null && l1.Items.Count == 1, "count");
+        if (l1 is not null)
+        {
+            var one = l1.Items[0];
+            Check("迁移不会静默关掉用户已启用的接口", one.Enabled, "Enabled 丢了");
+            Check("迁移保留显示名", one.DisplayName == "我的网关", one.DisplayName);
+            Check("迁移保留路径与模型范围", one.Path == "/api/log/self" && one.ModelScope == "deepseek-", one.Path);
+            Check("包进来的一条拿到 id", !string.IsNullOrWhiteSpace(one.Id), "没拿到 id");
+        }
+
+        var arr = "[{\"DisplayName\":\"A\",\"Enabled\":true},{\"DisplayName\":\"B\"}]";
+        var a1 = ProviderRegistry.Parse(arr);
+        Check("数组形态读出两条", a1 is not null && a1.Items.Count == 2, "count");
+        if (a1 is not null)
+        {
+            Check("两条各自拿到不同 id", a1.Items[0].Id != a1.Items[1].Id, "id 撞了");
+            var round = ProviderRegistry.Parse(a1.ToJson());
+            Check("序列化再读回仍是两条", round is not null && round.Items.Count == 2, "roundtrip");
+            Check("往返后 id 不变",
+                round is not null && round.Items[0].Id == a1.Items[0].Id && round.Items[1].Id == a1.Items[1].Id, "id 变了");
+        }
+
+        // 坏值必须返回 null：调用方据此拒绝写回。整键覆盖写回时把默认值当解析结果，就等于抹掉真配置。
+        Check("语法错的 JSON 判为不可读", ProviderRegistry.Parse("{ 这不是 JSON") is null, "不该算成功");
+        Check("既非数组也非对象的值判为不可读", ProviderRegistry.Parse("123") is null, "不该算成功");
+        Check("空数组是合法空列表而不是失败", ProviderRegistry.Parse("[]") is { Items.Count: 0 }, "[] 应当成功");
+
+        var dup = "[{\"Id\":\"same\",\"DisplayName\":\"A\"},{\"Id\":\"same\",\"DisplayName\":\"B\"}]";
+        var d1 = ProviderRegistry.Parse(dup);
+        Check("重复 id 被自动改掉（同 id 的两份账本会互相覆盖）",
+            d1 is not null && d1.Items[0].Id != d1.Items[1].Id, "dup 没解决");
+
+        // 这条锁住那个坑本身：ProviderConfig.Parse 遇到数组会静默回默认值（Enabled=false）。
+        // 所以设置页里任何还直接调它的写点都必须改走 ProviderRegistry，
+        // 否则用户碰一下「完整配置 JSON」框就把其它接口全抹了。
+        var trap = ProviderConfig.Parse(arr);
+        Check("ProviderConfig.Parse 读数组会静默回默认值（已知陷阱，调用点必须走 Registry）",
+            !trap.Enabled && string.IsNullOrEmpty(trap.BaseUrl), "行为变了，重新评估所有调用点");
     }
 }
