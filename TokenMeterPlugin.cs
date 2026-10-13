@@ -306,6 +306,7 @@ public sealed class TokenMeterPlugin : IslandPluginBase
             var sb = SnapshotBuilder.BuildBlock(serverPart, serverPricing, cfg.DisplayName);
             blocks.Add(lb);
             blocks.Add(sb);
+            MaybeLogReconcileSample(sb, cfg);
             splitNote = split.Note;
             splitWarning = split.DroppedNote;
             primary = lb.HasData ? lb : sb;
@@ -375,7 +376,7 @@ public sealed class TokenMeterPlugin : IslandPluginBase
             : (_coveredUntilUtc ?? nowUtc.AddMinutes(-cfg.LagMinutes));
 
         _serverLedger = merged;
-        _providerState.SaveLedger(merged);
+        _providerState.SaveLedger(merged, cfg.LedgerKeepDays);
         _coveredUntilUtc = advanced;
         _providerState.CoveredUntilUtc = advanced;
         _providerState.LastSuccessUtc = nowUtc;
@@ -394,6 +395,39 @@ public sealed class TokenMeterPlugin : IslandPluginBase
         Log.Info($"服务端用量拉取完成：{windows} 段 / {pages} 页 / {Format.Bytes(bytes)}"
                + (hitBudget ? $"（本轮接口预算 {cfg.ProviderBudgetSeconds}s 用完，剩余窗口下轮继续）" : string.Empty)
                + $"，水位线推到 {advanced:yyyy-MM-dd HH:mm}Z，累计 {Format.Tokens(_providerState.ServerTotalTokens)} token");
+    }
+
+    private DateTime? _lastReconcileLogUtc;
+
+    /// <summary>
+    /// 对账辅助输出：把云端块最近若干天的「按单价推算费用」与「接口上报金额」并排写进日志。
+    /// InputIncludesCached 这个口径本机没有可验证的样本（账号里还没有 cache_tokens&gt;0 的记录），
+    /// 只能靠用户拿某一天的上报金额去和网关控制台账单对，所以这里只出数、不下结论。
+    /// 半小时最多一条：今日数字每分钟都在涨，不设闸就会刷屏（同类告警刷屏修过一次）。
+    /// </summary>
+    private void MaybeLogReconcileSample(SourceBlock serverBlock, ProviderConfig cfg)
+    {
+        if (!serverBlock.HasData || serverBlock.Last7.Count == 0) return;
+
+        var nowUtc = DateTime.UtcNow;
+        if (_lastReconcileLogUtc is not null && nowUtc - _lastReconcileLogUtc.Value < TimeSpan.FromMinutes(30)) return;
+        _lastReconcileLogUtc = nowUtc;
+
+        var cur = string.IsNullOrWhiteSpace(cfg.Currency) ? "$" : cfg.Currency.Trim();
+        var lines = new List<string>();
+        foreach (var p in serverBlock.Last7)
+        {
+            var diff = p.ServerCost > 0
+                ? (int)Math.Round((double)(p.Cost - p.ServerCost) * 100.0 / (double)p.ServerCost)
+                : 0;
+            lines.Add($"  {p.Day:yyyy-MM-dd}｜{Format.Tokens(p.Total)} tok｜推算 {p.Cost:0.####}{cur}｜"
+                    + $"上报 {p.ServerCost:0.####}{cur}｜推算比上报 {(diff >= 0 ? "+" : "")}{diff}%");
+        }
+
+        Log.Info($"对账辅助（当前 InputIncludesCached={(cfg.InputIncludesCached ? "true" : "false")}）："
+            + "挑一天拿「上报」去对网关控制台账单。推算持续**高于**上报＝有东西被重复计费，"
+            + "当前若是 false 就该改 true；持续**低于**＝少算了，当前若是 true 就该改 false。"
+            + "两种情况都要先排除单价本身填错或该模型未定价。\n" + string.Join("\n", lines));
     }
 
     private void RememberProviderFailure(string note)

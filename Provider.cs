@@ -158,6 +158,11 @@ public sealed class ProviderConfig
     /// <summary>服务端总量比本地少超过这个比例时，界面标警告而不是静默覆盖。</summary>
     public int UndercountWarnPercent { get; set; } = 10;
 
+    /// <summary>云端账本在状态文件里保留多少天，超出的整天直接丢。0 = 不清理。
+    /// 默认 730：够月视图与「全部」口径用，同时给长期运行封个顶
+    /// （每天×每模型一个条目，不清理的话状态文件会一直涨）。</summary>
+    public int LedgerKeepDays { get; set; } = 730;
+
     private static readonly JsonSerializerOptions JsonOpts = new()
     {
         WriteIndented = false,
@@ -180,6 +185,7 @@ public sealed class ProviderConfig
             cfg.MaxPagesPerWindow = Math.Clamp(cfg.MaxPagesPerWindow, 1, 500);
             cfg.MaxWindowsPerRun = Math.Clamp(cfg.MaxWindowsPerRun, 1, 200);
             cfg.InitialBackfillDays = Math.Clamp(cfg.InitialBackfillDays, 1, 366);
+            cfg.LedgerKeepDays = Math.Clamp(cfg.LedgerKeepDays, 0, 3660);
             return cfg;
         }
         catch (Exception)
@@ -361,7 +367,7 @@ public sealed class ProviderState
     /// </summary>
     public Dictionary<string, Dictionary<string, long[]>> ServerDays { get; set; } = new();
 
-    public void SaveLedger(UsageLedger? ledger)
+    public void SaveLedger(UsageLedger? ledger, int keepDays = 0)
     {
         var map = new Dictionary<string, Dictionary<string, long[]>>(StringComparer.Ordinal);
         if (ledger is not null)
@@ -373,6 +379,15 @@ public sealed class ProviderState
                 map[day] = m;
             }
         }
+
+        if (keepDays > 0)
+        {
+            // 键就是 yyyy-MM-dd，序数比字符串等于比日期，不用解析
+            var cutoff = DateOnly.FromDateTime(DateTime.Now).AddDays(-keepDays).ToString("yyyy-MM-dd");
+            foreach (var stale in map.Keys.Where(k => string.CompareOrdinal(k, cutoff) < 0).ToList())
+                map.Remove(stale);
+        }
+
         ServerDays = map;
     }
 
