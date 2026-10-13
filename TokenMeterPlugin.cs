@@ -33,9 +33,9 @@ public sealed class TokenMeterPlugin : IslandPluginBase
     private MultiProviderState _states = new();
     private string _cacheDir = string.Empty;
 
-    /// <summary>上一次成功读到的接口列表。配置读不通时沿用它，并拒绝写回。</summary>
-    private List<ProviderConfig> _providersLastGood = new();
-    private bool _providersReadable = true;
+    /// <summary>当前生效的接口列表（来自 providers.json）与读到时文件的修改时刻。</summary>
+    private List<ProviderConfig> _providers = new();
+    private DateTime _providersStamp = DateTime.MinValue;
 
     private readonly SemaphoreSlim _gate = new(1, 1);
     private CancellationTokenSource _cts = new();
@@ -82,7 +82,7 @@ public sealed class TokenMeterPlugin : IslandPluginBase
         Context.Register(Context.OnSettingsChanged("pricing", OnPricingChanged));
         Context.Register(Context.OnSettingsChanged("roots", () => _ = RefreshAsync("数据目录变更")));
         Context.Register(Context.OnSettingsChanged("localScope", () => RecomputeFromLedger("模型归属变更")));
-        Context.Register(Context.OnSettingsChanged("provider", OnProviderConfigChanged));
+        // provider 键不再监听：接口配置已搬到 providers.json，由心跳查文件变化
         Context.Register(Context.OnSettingsChanged("refreshSeconds", () => { _secondsSinceRefresh = 0; }));
 
         if (Settings.Get("enabled", true)) SetContent(_content);
@@ -145,6 +145,14 @@ public sealed class TokenMeterPlugin : IslandPluginBase
     private void OnTick()
     {
         _secondsSinceRefresh++;
+
+        // 手改了配置文件就自动生效，不要求用户去点按钮。这里只比一次时间戳，很便宜。
+        if (!_busy && ProvidersFileChanged())
+        {
+            _secondsSinceRefresh = 0;
+            _ = RefreshAsync("配置文件已修改");
+            return;
+        }
 
         var interval = Math.Max(10, Settings.Get("refreshSeconds", 60));
         if (_secondsSinceRefresh >= interval && !_busy)
@@ -512,27 +520,6 @@ public sealed class TokenMeterPlugin : IslandPluginBase
         Log.Info("接口已恢复，上一轮问题：" + last);
     }
 
-    private void OnProviderConfigChanged()
-    {
-        var providers = LoadProviders();
-        var dropped = false;
-
-        // 逐个接口判断：关掉某一个只能丢它自己的服务端数据，不能顺手把别家也清了
-        foreach (var p in providers.Where(x => !x.Enabled))
-        {
-            if (_serverLedgers.Remove(p.Id) | _coveredUntil.Remove(p.Id)) dropped = true;
-            _states.For(p.Id).CoveredUntilUtc = null;
-        }
-
-        if (dropped)
-        {
-            SaveStates();
-            Log.Info("有接口被关闭：它那份服务端数据不再参与合并，这部分回到本地日志兜底");
-        }
-
-        _ = RefreshAsync("接口配置变更");
-    }
-
     private string StatePathV2() => Path.Combine(_cacheDir, "provider-state-v2.json");
     private string StatePathV1() => Path.Combine(_cacheDir, "provider-state-v1.json");
 
@@ -841,348 +828,78 @@ public sealed class TokenMeterPlugin : IslandPluginBase
         moneyRow.Children.Add(perBox);
         page.Children.Add(Card(moneyRow));
 
-        // ---- 服务端用量接口（优先于本地日志，失败自动降级）----
-        var provList = LoadProviders();
-        var prov = Editing(provList);
-        if (string.IsNullOrEmpty(_editingId)) _editingId = prov.Id;   // 首次进设置页时定下编辑对象
-
+        // ---- 服务端用量接口：配置搬到插件目录的 providers.json，这一页只负责看和重载 ----
         page.Children.Add(new TextBlock
         {
-            Text = "服务端用量接口（可选）",
+            Text = "服务端用量接口（配置文件）",
             FontSize = 13,
             Margin = new Thickness(0, 8, 0, 0),
         });
-        // 接口选择器：这里只建控件摆位置，**事件留到所有输入框都声明之后再挂** ——
-        // C# 闭包捕获的是局部变量本身，处理器写在 provScopeBox 等声明之前会引用不到。
-        var providerPicker = new ComboBox
-        {
-            Header = "当前编辑的接口",
-            MinWidth = 320,
-            HorizontalAlignment = HorizontalAlignment.Left,
-        };
-        foreach (var p in provList) providerPicker.Items.Add(LabelOf(p));
-        providerPicker.SelectedIndex = provList.IndexOf(prov);
-        var addProvider = new Button { Content = "新增接口", VerticalAlignment = VerticalAlignment.Center };
-        var delProvider = new Button { Content = "删除此接口", VerticalAlignment = VerticalAlignment.Center };
-        var pickerStatus = new TextBlock { FontSize = 12, Opacity = 0.8, TextWrapping = TextWrapping.Wrap };
-        var pickerRow = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 12 };
-        pickerRow.Children.Add(providerPicker);
-        pickerRow.Children.Add(addProvider);
-        pickerRow.Children.Add(delProvider);
-        page.Children.Add(Card(pickerRow));
-        page.Children.Add(pickerStatus);
-
         page.Children.Add(new TextBlock
         {
-            Text = "每个接口各自独立统计、分列显示，绝不跨币种相加。同一个模型被两个接口同时上报时"
-                 + "谁都不认，会改由本地日志显示并在这里报出来 —— 给其中一个接口设「云端统计哪些模型」来排除。",
-            FontSize = 12,
-            TextWrapping = TextWrapping.Wrap,
-            Opacity = 0.75,
-        });
-        page.Children.Add(new TextBlock
-        {
-            Text = "启用后优先用服务端数据计费与跨设备汇总；接口不可用、超时或权限不足时自动降级回本地日志。"
-                 + "密钥不保存在插件里，只填环境变量名。下面这些默认值只是 OpenAI 风格的示例，"
-                 + "请按你账号实际能调通的接口改（字段名、分页、时间跨度限制都在高级 JSON 里）。",
+            Text = "接口配置不在这一页上编辑了。它以前住在宿主设置里，配一套按 id 关联的表单，"
+                 + "而那套表单出过事故（一点即删、套预设会整份覆盖），把真实配置弄没过一次。"
+                 + "现在它是插件目录下一个普通的 JSON 数组文件：可以手改、可以备份、可以拿 git 比差异。"
+                 + "保存后插件会在下一次心跳自动读到；不放心就点下面的「重新读取」。"
+                 + "每个接口各自独立统计、分列显示，绝不跨币种相加；同一个模型被两个接口同时上报时谁都不认，"
+                 + "会改由本地日志显示并在下面状态里报出来。密钥不写在文件里，只写环境变量名。",
             FontSize = 12,
             TextWrapping = TextWrapping.Wrap,
             Opacity = 0.75,
         });
 
-        var provToggle = new ToggleSwitch { Header = "启用服务端接口", IsOn = prov.Enabled };
-        provToggle.Toggled += (_, _) => SetProvider(c => c.Enabled = provToggle.IsOn);
-        page.Children.Add(Card(provToggle));
-
-        // 云端只算它自己报上来的模型；两边重叠时以云端为准并从本地剔掉，避免算两遍
-        var provScopeBox = MakeLine("云端统计哪些模型（逗号分隔，留空 = 上报什么就归什么）", prov.ModelScope, "例如 deepseek-, claude-", 460);
-        var provCurrencyBox = MakeLine("云端币种", prov.Currency, "$", 120);
-        CommitOnEnter(provScopeBox, () => SetProvider(c => c.ModelScope = (provScopeBox.Text ?? string.Empty).Trim()));
-        CommitOnEnter(provCurrencyBox, () => SetProvider(c => c.Currency = (provCurrencyBox.Text ?? string.Empty).Trim()));
-        page.Children.Add(Card(provScopeBox));
-        page.Children.Add(Card(provCurrencyBox));
-
-        var baseUrlBox = MakeLine("接口根地址 BaseUrl", prov.BaseUrl, "https://api.example.com/v1", 460);
-        var pathBox = MakeLine("用量查询路径 Path", prov.Path, "/organization/usage/completions", 460);
-        CommitOnEnter(baseUrlBox, () => SetProvider(c => c.BaseUrl = (baseUrlBox.Text ?? string.Empty).Trim().TrimEnd('/')));
-        CommitOnEnter(pathBox, () => SetProvider(c =>
+        var provPathBox = new TextBox
         {
-            var p = (pathBox.Text ?? string.Empty).Trim();
-            if (p.Length > 0 && !p.StartsWith('/')) p = "/" + p;
-            c.Path = p;
-        }));
-        page.Children.Add(Card(baseUrlBox));
-        page.Children.Add(Card(pathBox));
-
-        var envBox = MakeLine("密钥所在环境变量名", prov.ApiKeyEnvVar, "TOKEN_METER_API_KEY", 300);
-        var provNameBox = MakeLine("显示名", prov.DisplayName, "自定义接口", 200);
-        CommitOnEnter(envBox, () => SetProvider(c => c.ApiKeyEnvVar = (envBox.Text ?? string.Empty).Trim()));
-        CommitOnEnter(provNameBox, () => SetProvider(c => c.DisplayName = (provNameBox.Text ?? string.Empty).Trim()));
-        var provRow1 = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 12 };
-        provRow1.Children.Add(provNameBox);
-        provRow1.Children.Add(envBox);
-        page.Children.Add(Card(provRow1));
-
-        var winBox = MakeLine("单段最大天数", prov.WindowMaxDays.ToString(CultureInfo.InvariantCulture), "30", 150);
-        var lagBox = MakeLine("滞后分钟", prov.LagMinutes.ToString(CultureInfo.InvariantCulture), "120", 150);
-        var backfillBox = MakeLine("首次往回追天数", prov.InitialBackfillDays.ToString(CultureInfo.InvariantCulture), "7", 150);
-        CommitOnEnter(winBox, () => SetProvider(c => { if (TryInt(winBox.Text, out var v)) c.WindowMaxDays = v; }));
-        CommitOnEnter(lagBox, () => SetProvider(c => { if (TryInt(lagBox.Text, out var v)) c.LagMinutes = v; }));
-        CommitOnEnter(backfillBox, () => SetProvider(c => { if (TryInt(backfillBox.Text, out var v)) c.InitialBackfillDays = v; }));
-        var provRow2 = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 12 };
-        provRow2.Children.Add(winBox);
-        provRow2.Children.Add(lagBox);
-        provRow2.Children.Add(backfillBox);
-        page.Children.Add(Card(provRow2));
-
-        // 预设：把「接一家要改哪十来个字段」变成一次选择。套用后仍要自己填 BaseUrl 与环境变量密钥。
-        var presetBox = new ComboBox
-        {
-            Header = "套用接口预设",
-            MinWidth = 320,
-            HorizontalAlignment = HorizontalAlignment.Left,
-        };
-        foreach (var pr in ProviderPresets.All) presetBox.Items.Add(pr.Name);
-        presetBox.PlaceholderText = "选一个，再点右边按钮";
-        var applyPreset = new Button { Content = "套用所选预设", VerticalAlignment = VerticalAlignment.Center };
-        var presetRow = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 12 };
-        presetRow.Children.Add(presetBox);
-        presetRow.Children.Add(applyPreset);
-        page.Children.Add(Card(presetRow));
-
-        // 高级：整份配置直接改。Parse 对坏 JSON 会静默回默认值，所以这里先严格校验再落盘。
-        var jsonBox = new TextBox
-        {
-            Header = "完整配置 JSON（字段映射、分页、口径都在这里改）",
-            Text = prov.ToJson(),
-            AcceptsReturn = true,
-            TextWrapping = TextWrapping.Wrap,
+            Header = "配置文件路径",
+            Text = ProvidersPath(),
+            IsReadOnly = true,
             MinWidth = 640,
-            MinHeight = 220,
-            FontFamily = new FontFamily("Consolas, Cascadia Mono"),
-            Visibility = Visibility.Collapsed,
         };
-        var jsonStatus = new TextBlock { FontSize = 12, Opacity = 0.8, TextWrapping = TextWrapping.Wrap };
-        var jsonToggle = new Button { Content = "展开编辑完整配置 JSON" };
+        page.Children.Add(Card(provPathBox));
 
-        void CommitProviderJson()
+        var provStatusText = new TextBlock { FontSize = 12, TextWrapping = TextWrapping.Wrap, Opacity = 0.85 };
+
+        void RenderProviderStatus()
         {
-            var text = (jsonBox.Text ?? string.Empty).Trim();
-            if (text.Length == 0) return;
-            try
-            {
-                using var _ = JsonDocument.Parse(text);   // 先验语法，坏就拒绝保存
-            }
-            catch (Exception ex)
-            {
-                jsonStatus.Text = "JSON 格式不对，没有保存：" + ex.Message;
-                return;
-            }
-            // 这个框编辑的是「当前选中的那一个接口」，不是整份存储：存储是数组，
-            // 直接整键写回会把其它接口抹掉，所以只替换当前那一条、并保住它的 id。
-            var edited = ProviderConfig.Parse(text);
             var list = LoadProviders();
-            var idx = list.IndexOf(Editing(list));
-            edited.Id = list[idx].Id;      // 编辑框里没有 id 概念，别让手改 JSON 把身份弄丢
-            list[idx] = edited;
-            if (string.Equals(new ProviderRegistry { Items = list }.ToJson(),
-                    Settings.Get("provider", string.Empty), StringComparison.Ordinal)) return;
-            if (!SaveProviders(list))
-            {
-                jsonStatus.Text = "接口配置当前读不通，为了不把原有配置覆盖掉，本次没有保存。";
-                return;
-            }
-            jsonBox.Text = edited.ToJson();                  // 回填规范化后的内容，让用户看到默认值被补全了什么
-            jsonStatus.Text = "已保存并重新拉取。";
-        }
-        jsonBox.LostFocus += (_, _) => CommitProviderJson();
-
-        // 默认收起：整份 JSON 平铺在页面上既占地方也容易误改，点按钮才展开编辑
-        jsonToggle.Click += (_, _) =>
-        {
-            if (jsonBox.Visibility == Visibility.Visible)
-            {
-                CommitProviderJson();          // 收起前先落盘，不依赖 LostFocus
-                jsonBox.Visibility = Visibility.Collapsed;
-                jsonToggle.Content = "展开编辑完整配置 JSON";
-            }
-            else
-            {
-                // 每次展开都从设置里重读，避免刚才用上面那些单字段框改过之后看到旧内容
-                jsonBox.Text = Editing(LoadProviders()).ToJson();
-                jsonBox.Visibility = Visibility.Visible;
-                jsonToggle.Content = "保存并收起";
-                jsonBox.Focus(FocusState.Programmatic);
-            }
-        };
-
-        page.Children.Add(jsonToggle);
-        page.Children.Add(jsonBox);
-        page.Children.Add(jsonStatus);
-
-        // 套用预设：不改用户当前的联网开关，也不保存任何密钥
-        applyPreset.Click += (_, _) =>
-        {
-            var idx = presetBox.SelectedIndex;
-            if (idx < 0 || idx >= ProviderPresets.All.Length)
-            {
-                Status("先从下拉里选一个预设。");
-                return;
-            }
-
-            var preset = ProviderPresets.All[idx];
-            var cfg = preset.Build();
-            var list = LoadProviders();
-            var at = list.IndexOf(Editing(list));
-            cfg.Enabled = list[at].Enabled;   // 套用预设不改用户当前的联网开关
-            cfg.Id = list[at].Id;             // 也别弄丢身份，否则已积累的云端账本会成孤儿
-            var alias = (provNameBox.Text ?? string.Empty).Trim();
-            if (alias.Length > 0) cfg.DisplayName = alias;
-
-            list[at] = cfg;
-            SaveProviders(list);             // 触发 OnProviderConfigChanged → 重新拉取
-
-            if (provToggle.IsOn != cfg.Enabled) provToggle.IsOn = cfg.Enabled;
-            baseUrlBox.Text = cfg.BaseUrl;
-            pathBox.Text = cfg.Path;
-            envBox.Text = cfg.ApiKeyEnvVar;
-            winBox.Text = cfg.WindowMaxDays.ToString(CultureInfo.InvariantCulture);
-            lagBox.Text = cfg.LagMinutes.ToString(CultureInfo.InvariantCulture);
-            backfillBox.Text = cfg.InitialBackfillDays.ToString(CultureInfo.InvariantCulture);
-            jsonBox.Text = cfg.ToJson();
-            Status($"已套用「{preset.Name}」（{preset.Basis}）。密钥请自己设进环境变量 {cfg.ApiKeyEnvVar}，插件不保存它。");
-        };
-
-        // ---- 接口选择器的事件（到这里所有输入框都声明完了，闭包才引用得到）----
-
-        void RefillProviderFields()
-        {
-            if (_refillingProviderUi) return;      // 挡住 Clear() 触发的 SelectionChanged 回环
-            _refillingProviderUi = true;
-            try
-            {
-                var list = LoadProviders();
-                var cur = Editing(list);
-                // 必须先改 _editingId 再动控件：provToggle 被程序赋值会触发 Toggled → SetProvider，
-                // 目标要是旧接口，就会把旧接口的字段写成新接口的值。指向对了之后写进去的就是
-                // 它自己的值，前后一比对相等，不会落盘。
-                _editingId = cur.Id;
-
-                // 只在标签真的变了才重建列表：Items.Clear() 会把选中项变成 -1 并再触发一次
-                // SelectionChanged，既危险又会闪一下
-                var labels = list.Select(LabelOf).ToList();
-                var same = providerPicker.Items.Count == labels.Count;
-                if (same)
-                {
-                    for (var i = 0; i < labels.Count; i++)
-                    {
-                        if (!string.Equals(providerPicker.Items[i] as string, labels[i], StringComparison.Ordinal)) { same = false; break; }
-                    }
-                }
-                if (!same)
-                {
-                    providerPicker.Items.Clear();
-                    foreach (var s in labels) providerPicker.Items.Add(s);
-                }
-                providerPicker.SelectedIndex = list.IndexOf(cur);
-
-                provToggle.IsOn = cur.Enabled;
-                provScopeBox.Text = cur.ModelScope;
-                provCurrencyBox.Text = cur.Currency;
-                baseUrlBox.Text = cur.BaseUrl;
-                pathBox.Text = cur.Path;
-                envBox.Text = cur.ApiKeyEnvVar;
-                provNameBox.Text = cur.DisplayName;
-                winBox.Text = cur.WindowMaxDays.ToString(CultureInfo.InvariantCulture);
-                lagBox.Text = cur.LagMinutes.ToString(CultureInfo.InvariantCulture);
-                backfillBox.Text = cur.InitialBackfillDays.ToString(CultureInfo.InvariantCulture);
-                jsonBox.Text = cur.ToJson();
-            }
-            finally { _refillingProviderUi = false; }
+            provStatusText.Text = list.Count == 0
+                ? "当前没有加载到任何接口。"
+                : "已加载 " + list.Count + " 个接口："
+                  + string.Join("；", list.Select(p => $"{LabelOf(p)}（{(p.Enabled ? "启用" : "未启用")}｜{p.BaseUrl}{p.Path}）"));
         }
 
-        providerPicker.SelectionChanged += (_, _) =>
+        RenderProviderStatus();
+        page.Children.Add(Card(provStatusText));
+
+        var provReload = new Button { Content = "重新读取配置文件", VerticalAlignment = VerticalAlignment.Center };
+        var provSample = new Button { Content = "生成示例配置（仅当文件不存在）", VerticalAlignment = VerticalAlignment.Center };
+        var provRow = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 12 };
+        provRow.Children.Add(provReload);
+        provRow.Children.Add(provSample);
+        page.Children.Add(Card(provRow));
+
+        provReload.Click += (_, _) =>
         {
-            if (_refillingProviderUi) return;      // 程序重填不算用户操作
-            var i = providerPicker.SelectedIndex;
-            if (i < 0) return;
-            var list = LoadProviders();
-            if (i >= list.Count) return;
-            _editingId = list[i].Id;
-            RefillProviderFields();
-            pickerStatus.Text = $"已切到「{LabelOf(list[i])}」，上面那些框现在编辑的就是它。";
+            RenderProviderStatus();
+            _ = RefreshAsync("手动重新读取配置");
         };
 
-        addProvider.Click += (_, _) =>
+        // 只在文件不存在时生成：文件已经存在就绝不覆盖，这样「生成示例」不可能再弄丢真实配置
+        provSample.Click += (_, _) =>
         {
-            var list = LoadProviders();
-            var fresh = new ProviderConfig
+            if (File.Exists(ProvidersPath()))
             {
-                Id = ProviderRegistry.NewId(),
-                DisplayName = $"接口 {list.Count + 1}",
-                Enabled = false,               // 新接口默认不联网：没填完就开始发请求只会刷错误
-                ApiKeyEnvVar = "TOKEN_METER_API_KEY",
-            };
-            list.Add(fresh);
-            if (!SaveProviders(list))
-            {
-                pickerStatus.Text = "接口配置当前读不通，没有新增。";
-                return;
-            }
-            _editingId = fresh.Id;                 // 不指过去的话，重填的还是原来那个，看不见新接口
-            RefillProviderFields();
-            pickerStatus.Text = "已新增一个接口（默认未启用）。填好地址、路径并把密钥设进环境变量之后再打开开关。";
-        };
-
-        delProvider.Click += (_, _) =>
-        {
-            var list = LoadProviders();
-            var cur = Editing(list);
-
-            // 删除是这里唯一不可逆的动作：它会连带清掉那份接口的云端账本。
-            // 一点就删已经造成过一次事故，所以改成两段式确认，第二次点击才真删。
-            var armed = (delProvider.Tag as string) == cur.Id;
-            if (!armed)
-            {
-                if (list.Count <= 1)
-                {
-                    pickerStatus.Text = "只剩一个接口了：要停用请直接用上面的开关，不要用删除。";
-                    return;
-                }
-                delProvider.Tag = cur.Id;
-                delProvider.Content = $"确认删除「{LabelOf(cur)}」？";
-                pickerStatus.Text = "删除会连带清掉这个接口已积累的云端账本，且无法撤销。"
-                    + "要停用请改用上面的开关。再点一次这个按钮才执行删除。";
+                provStatusText.Text = "配置文件已经存在，没有动它。要换接口请直接编辑那个文件。";
                 return;
             }
 
-            delProvider.Tag = null;
-            delProvider.Content = "删除此接口";
-
-            if (list.Count <= 1)
-            {
-                pickerStatus.Text = "只剩一个接口了：要停用请直接用上面的开关，不要用删除。";
-                return;
-            }
-
-            list.Remove(cur);
-            if (!SaveProviders(list))
-            {
-                pickerStatus.Text = "接口配置当前读不通，没有删除。";
-                return;
-            }
-
-            // 它的内存账本与持久化账本都要跟着走，否则状态文件里留一个再没人读的孤儿
-            _serverLedgers.Remove(cur.Id);
-            _coveredUntil.Remove(cur.Id);
-            _lastProviderNotes.Remove(cur.Id);
-            _lastReconcileLogUtc.Remove(cur.Id);
-            _states.DropOrphans(list.Select(p => p.Id));
-            SaveStates();
-
-            _editingId = list[0].Id;
-            RefillProviderFields();
-            pickerStatus.Text = $"已删除「{LabelOf(cur)}」以及它那份云端账本。";
+            var seed = new List<ProviderConfig> { ProviderPresets.All[1].Build() };
+            seed[0].Id = ProviderRegistry.NewId();
+            seed[0].Enabled = false;
+            provStatusText.Text = WriteProvidersFile(seed, out var err)
+                ? "已生成示例配置（未启用）。请把 New-Api-User 等字段填成你自己的值，再把 Enabled 改成 true。"
+                : "生成失败：" + err;
+            RenderProviderStatus();
         };
 
         // ---- 模型单价表 ----
@@ -1306,7 +1023,6 @@ public sealed class TokenMeterPlugin : IslandPluginBase
             CommitCurrency(currencyBox);
             CommitPer(perBox);
             CommitPriority(priorityBox);
-            CommitProviderJson();
             Status("正在刷新…");
             _ = RefreshAsync("手动刷新");
         };
@@ -1485,72 +1201,89 @@ public sealed class TokenMeterPlugin : IslandPluginBase
 
     // ---- 三个提交点：失焦 + 回车 + 动作前（§15.1）----
 
+    /// <summary>接口配置文件：插件目录下的一个普通 JSON 数组。</summary>
+    private string ProvidersPath() => Path.Combine(PluginDirectory, "providers.json");
+
     /// <summary>
-    /// 读接口列表。存储从"单个对象"改成"数组"之后，所有读写都必须走这里：
-    /// ProviderConfig.Parse 遇到数组会**静默返回默认值（Enabled=false）**，
-    /// 谁漏走一步，用户随手一保存就把已有的全部接口抹掉（这条已用断言钉住）。
-    /// 读不通时沿用上一次成功的副本并置 _providersReadable=false，
-    /// 因为保存是整键覆盖，拿默认值覆盖等于毁配置。
+    /// 读接口配置，**文件是唯一真相**。
+    /// 它以前住在宿主设置里，配一套按 id 关联的设置页表单，而那套表单出过事故
+    /// （一点即删、套预设会整份覆盖），把真实配置弄没过一次。搬成纯文本之后
+    /// 可手改、可备份、可 diff，而且设置页再也没有能力覆盖它。
+    /// 读不通时沿用上一次成功的副本且绝不写回 —— 坏文件不该把好配置盖掉。
     /// </summary>
     private List<ProviderConfig> LoadProviders()
     {
-        var reg = ProviderRegistry.Parse(Settings.Get("provider", string.Empty));
-        if (reg is null)
+        var path = ProvidersPath();
+        try
         {
-            if (_providersReadable)
-                Log.Warn("接口配置读不通（JSON 损坏或结构不认识）：本轮沿用上一次成功读到的配置，并拒绝写回设置，避免抹掉原有配置");
-            _providersReadable = false;
-            return _providersLastGood.Count > 0
-                ? _providersLastGood
-                : new List<ProviderConfig> { new() { Id = ProviderRegistry.NewId() } };
+            if (File.Exists(path))
+            {
+                _providersStamp = new FileInfo(path).LastWriteTimeUtc;
+                var reg = ProviderRegistry.Parse(File.ReadAllText(path));
+                if (reg is null)
+                {
+                    Log.Warn("providers.json 读不通（JSON 损坏或结构不认识）：本轮沿用上一次成功读到的配置，不会写回文件");
+                    return _providers;
+                }
+                _providers = reg.Items;
+                return _providers;
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Warn($"读 providers.json 失败，沿用上一次成功读到的配置：{ex.Message}");
+            return _providers;
         }
 
-        if (reg.Items.Count == 0) reg.Items.Add(new ProviderConfig { Id = ProviderRegistry.NewId() });
-        _providersReadable = true;
-        _providersLastGood = reg.Items;
-        return reg.Items;
+        // 文件还不存在：把宿主设置里的旧配置迁出来一次，此后设置里那份不再参与
+        var legacy = ProviderRegistry.Parse(Settings.Get("provider", string.Empty));
+        if (legacy is { Items.Count: > 0 })
+        {
+            _providers = legacy.Items;
+            if (WriteProvidersFile(_providers, out _))
+                Log.Info($"接口配置已从宿主设置迁移到 {path}（此后以文件为准）");
+            return _providers;
+        }
+
+        if (_providers.Count > 0) return _providers;
+
+        _providers = new List<ProviderConfig> { new() { Id = ProviderRegistry.NewId() } };
+        WriteProvidersFile(_providers, out _);
+        return _providers;
     }
 
-    /// <summary>整键覆盖写回。返回 false 表示因为读不通而拒绝保存——调用方要照实反馈，
-    /// 不能对着用户说"已保存"。</summary>
-    private bool SaveProviders(List<ProviderConfig> list)
+    private bool WriteProvidersFile(List<ProviderConfig> list, out string error)
     {
-        if (!_providersReadable)
+        error = string.Empty;
+        try
         {
-            Log.Warn("接口配置当前读不通，已拒绝本次保存，以免覆盖掉原有配置");
+            var path = ProvidersPath();
+            File.WriteAllText(path, new ProviderRegistry { Items = list }.ToJson());
+            _providersStamp = new FileInfo(path).LastWriteTimeUtc;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            error = ex.Message;
+            Log.Warn($"写 providers.json 失败：{ex.Message}");
             return false;
         }
-        Settings.Set("provider", new ProviderRegistry { Items = list }.ToJson());   // 触发 OnProviderConfigChanged
-        return true;
     }
 
-    /// <summary>设置页当前编辑的是哪个接口（按 id 定位，不按显示名——显示名可以重复）。
-    /// 找不到就退回列表第一个，保证任何时候都有编辑对象。</summary>
-    private string _editingId = string.Empty;
-
-    /// <summary>正在重填设置页的接口表单。用来挡住「重填 → 触发 SelectionChanged → 又重填」的递归：
-    /// ComboBox.Items.Clear() 会把选中项变成 -1 并触发 SelectionChanged，
-    /// 不加这道闸就是无限递归，直接把宿主进程以 StackOverflow 打死。</summary>
-    private bool _refillingProviderUi;
+    /// <summary>配置文件有没有被外部改过。心跳里查一次，改了就走一轮重载 ——
+    /// 用户手改保存之后不用点任何按钮也会生效。</summary>
+    private bool ProvidersFileChanged()
+    {
+        try
+        {
+            var path = ProvidersPath();
+            return File.Exists(path) && new FileInfo(path).LastWriteTimeUtc != _providersStamp;
+        }
+        catch (Exception) { return false; }
+    }
 
     private static string LabelOf(ProviderConfig p)
         => string.IsNullOrWhiteSpace(p.DisplayName) ? p.Id : p.DisplayName;
-
-    private ProviderConfig Editing(List<ProviderConfig> list)
-        => list.FirstOrDefault(p => p.Id == _editingId) ?? list[0];
-
-    /// <summary>改一个配置字段：只在真的变了时写回，避免每次失焦都触发一轮重拉。
-    /// 目标永远是「当前选中的那个接口」，不是列表第一项。</summary>
-    private void SetProvider(Action<ProviderConfig> mutate)
-    {
-        var list = LoadProviders();
-        var idx = list.IndexOf(Editing(list));
-        var target = list[idx];
-        var before = target.ToJson();
-        mutate(target);
-        if (string.Equals(before, target.ToJson(), StringComparison.Ordinal)) return;
-        SaveProviders(list);
-    }
 
     private static TextBox MakeLine(string header, string text, string placeholder, double minWidth)
         => new()

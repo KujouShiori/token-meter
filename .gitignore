@@ -9,3 +9,6 @@ Directory.Build.props
 
 # 运行时扫描缓存（正常落在宿主 plugins 目录内，防呆）
 .cache/
+
+# 接口配置（含本机接口地址与用户 ID，属用户数据，绝不随源码发布）
+providers.json
