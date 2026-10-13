@@ -327,7 +327,15 @@ public sealed class UsageScanner
         if (at < 0) return "(未知模型)";
         var i = at + 8;                        // 指向值的开引号
         var name = ReadJsonString(text, ref i);
-        return string.IsNullOrWhiteSpace(name) ? "(未知模型)" : name.Trim();
+        if (string.IsNullOrWhiteSpace(name)) return "(未知模型)";
+
+        // 有的客户端把「供应商 id/模型名」整个写进 model，而单价是全等匹配的，
+        // 不剥掉前缀就永远命中不了价格，界面上也只剩一串 UUID。
+        var slash = name.LastIndexOf('/');
+        if (slash >= 0 && slash < name.Length - 1) name = name[(slash + 1)..];
+
+        name = name.Trim();
+        return name.Length == 0 ? "(未知模型)" : name;
     }
 
     /// <summary>行首的 "timestamp":"...Z" 决定这条记录算哪天（换算到本地时区）。</summary>
@@ -390,11 +398,23 @@ public sealed class UsageScanner
             var value = ParseCount(raw);
             switch (key)
             {
-                case "input": c.Input = value; gotAny = true; break;
-                case "output": c.Output = value; gotAny = true; break;
-                case "cacheRead": c.CacheRead = value; gotAny = true; break;
-                case "cacheWrite": c.CacheWrite = value; gotAny = true; break;
-                case "totalTokens": c.Total = value; gotAny = true; break;
+                case "input":
+                case "input_tokens":              // Anthropic 原生：不含缓存部分
+                case "prompt_tokens":             // OpenAI Chat：已含缓存，所以不再另加 cacheRead
+                    c.Input = value; gotAny = true; break;
+                case "output":
+                case "output_tokens":
+                case "completion_tokens":
+                    c.Output = value; gotAny = true; break;
+                case "cacheRead":
+                case "cache_read_input_tokens":
+                    c.CacheRead = value; gotAny = true; break;
+                case "cacheWrite":
+                case "cache_creation_input_tokens":
+                    c.CacheWrite = value; gotAny = true; break;
+                case "totalTokens":
+                case "total_tokens":
+                    c.Total = value; gotAny = true; break;
                 default: break;                 // reasoning 已含在 output 里，cost 是钱，都不取
             }
         }
