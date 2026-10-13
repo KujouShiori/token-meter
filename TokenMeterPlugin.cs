@@ -860,8 +860,7 @@ public sealed class TokenMeterPlugin : IslandPluginBase
             MinWidth = 320,
             HorizontalAlignment = HorizontalAlignment.Left,
         };
-        foreach (var p in provList)
-            providerPicker.Items.Add(string.IsNullOrWhiteSpace(p.DisplayName) ? p.Id : p.DisplayName);
+        foreach (var p in provList) providerPicker.Items.Add(LabelOf(p));
         providerPicker.SelectedIndex = provList.IndexOf(prov);
         var addProvider = new Button { Content = "新增接口", VerticalAlignment = VerticalAlignment.Center };
         var delProvider = new Button { Content = "删除此接口", VerticalAlignment = VerticalAlignment.Center };
@@ -1058,39 +1057,60 @@ public sealed class TokenMeterPlugin : IslandPluginBase
 
         void RefillProviderFields()
         {
-            var list = LoadProviders();
-            var cur = Editing(list);
-            // 必须先改 _editingId 再动控件：provToggle 被程序赋值会触发 Toggled → SetProvider，
-            // 此时目标要是旧接口，就会把旧接口的字段写成新接口的值。
-            // 指向对了之后写进去的就是它自己的值，前后一比对，不会落盘。
-            _editingId = cur.Id;
+            if (_refillingProviderUi) return;      // 挡住 Clear() 触发的 SelectionChanged 回环
+            _refillingProviderUi = true;
+            try
+            {
+                var list = LoadProviders();
+                var cur = Editing(list);
+                // 必须先改 _editingId 再动控件：provToggle 被程序赋值会触发 Toggled → SetProvider，
+                // 目标要是旧接口，就会把旧接口的字段写成新接口的值。指向对了之后写进去的就是
+                // 它自己的值，前后一比对相等，不会落盘。
+                _editingId = cur.Id;
 
-            providerPicker.Items.Clear();
-            foreach (var p in list)
-                providerPicker.Items.Add(string.IsNullOrWhiteSpace(p.DisplayName) ? p.Id : p.DisplayName);
-            providerPicker.SelectedIndex = list.IndexOf(cur);
+                // 只在标签真的变了才重建列表：Items.Clear() 会把选中项变成 -1 并再触发一次
+                // SelectionChanged，既危险又会闪一下
+                var labels = list.Select(LabelOf).ToList();
+                var same = providerPicker.Items.Count == labels.Count;
+                if (same)
+                {
+                    for (var i = 0; i < labels.Count; i++)
+                    {
+                        if (!string.Equals(providerPicker.Items[i] as string, labels[i], StringComparison.Ordinal)) { same = false; break; }
+                    }
+                }
+                if (!same)
+                {
+                    providerPicker.Items.Clear();
+                    foreach (var s in labels) providerPicker.Items.Add(s);
+                }
+                providerPicker.SelectedIndex = list.IndexOf(cur);
 
-            provToggle.IsOn = cur.Enabled;
-            provScopeBox.Text = cur.ModelScope;
-            provCurrencyBox.Text = cur.Currency;
-            baseUrlBox.Text = cur.BaseUrl;
-            pathBox.Text = cur.Path;
-            envBox.Text = cur.ApiKeyEnvVar;
-            provNameBox.Text = cur.DisplayName;
-            winBox.Text = cur.WindowMaxDays.ToString(CultureInfo.InvariantCulture);
-            lagBox.Text = cur.LagMinutes.ToString(CultureInfo.InvariantCulture);
-            backfillBox.Text = cur.InitialBackfillDays.ToString(CultureInfo.InvariantCulture);
-            jsonBox.Text = cur.ToJson();
+                provToggle.IsOn = cur.Enabled;
+                provScopeBox.Text = cur.ModelScope;
+                provCurrencyBox.Text = cur.Currency;
+                baseUrlBox.Text = cur.BaseUrl;
+                pathBox.Text = cur.Path;
+                envBox.Text = cur.ApiKeyEnvVar;
+                provNameBox.Text = cur.DisplayName;
+                winBox.Text = cur.WindowMaxDays.ToString(CultureInfo.InvariantCulture);
+                lagBox.Text = cur.LagMinutes.ToString(CultureInfo.InvariantCulture);
+                backfillBox.Text = cur.InitialBackfillDays.ToString(CultureInfo.InvariantCulture);
+                jsonBox.Text = cur.ToJson();
+            }
+            finally { _refillingProviderUi = false; }
         }
 
         providerPicker.SelectionChanged += (_, _) =>
         {
+            if (_refillingProviderUi) return;      // 程序重填不算用户操作
             var i = providerPicker.SelectedIndex;
             if (i < 0) return;
             var list = LoadProviders();
             if (i >= list.Count) return;
+            _editingId = list[i].Id;
             RefillProviderFields();
-            pickerStatus.Text = $"已切到「{list[i].DisplayName}」，上面那些框现在编辑的就是它。";
+            pickerStatus.Text = $"已切到「{LabelOf(list[i])}」，上面那些框现在编辑的就是它。";
         };
 
         addProvider.Click += (_, _) =>
@@ -1109,6 +1129,7 @@ public sealed class TokenMeterPlugin : IslandPluginBase
                 pickerStatus.Text = "接口配置当前读不通，没有新增。";
                 return;
             }
+            _editingId = fresh.Id;                 // 不指过去的话，重填的还是原来那个，看不见新接口
             RefillProviderFields();
             pickerStatus.Text = "已新增一个接口（默认未启用）。填好地址、路径并把密钥设进环境变量之后再打开开关。";
         };
@@ -1484,6 +1505,14 @@ public sealed class TokenMeterPlugin : IslandPluginBase
     /// <summary>设置页当前编辑的是哪个接口（按 id 定位，不按显示名——显示名可以重复）。
     /// 找不到就退回列表第一个，保证任何时候都有编辑对象。</summary>
     private string _editingId = string.Empty;
+
+    /// <summary>正在重填设置页的接口表单。用来挡住「重填 → 触发 SelectionChanged → 又重填」的递归：
+    /// ComboBox.Items.Clear() 会把选中项变成 -1 并触发 SelectionChanged，
+    /// 不加这道闸就是无限递归，直接把宿主进程以 StackOverflow 打死。</summary>
+    private bool _refillingProviderUi;
+
+    private static string LabelOf(ProviderConfig p)
+        => string.IsNullOrWhiteSpace(p.DisplayName) ? p.Id : p.DisplayName;
 
     private ProviderConfig Editing(List<ProviderConfig> list)
         => list.FirstOrDefault(p => p.Id == _editingId) ?? list[0];
