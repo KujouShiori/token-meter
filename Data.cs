@@ -356,7 +356,10 @@ public static class SnapshotBuilder
                     point.Total += c.Total;
                     var priced = pricing.TryCost(model, c, out var cost);
                     point.Cost += cost;
-                    if (c.FromServer && c.Cost > 0) point.ServerCost = (decimal)c.Cost;
+                    // 必须是**累加**：一个来源一天可以有多个模型，各自都带服务端金额。
+                    // 写成赋值的话，同一天里最后一个模型会覆盖掉前面几个的金额，图上那一天的钱是少的
+                    // ——单模型账号完全看不出来，一接多模型来源就少报（本地假接口实机撞出来的）
+                    if (c.FromServer && c.Cost > 0) point.ServerCost += (decimal)c.Cost;
                     if (!priced && !(c.FromServer && c.Cost > 0)) point.HasUnpriced = true;
                 }
             }
