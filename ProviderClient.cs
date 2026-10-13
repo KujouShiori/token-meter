@@ -114,19 +114,22 @@ public sealed class ProviderClient : IDisposable
 
             using (resp)
             {
+                // 非 2xx 也先读一次 body：401/403/404 的响应体里常常正好写着那句能定位问题的话
+                var detail = resp.IsSuccessStatusCode
+                    ? string.Empty
+                    : await ErrorDetailAsync(resp, ct).ConfigureAwait(false);
+
                 if (resp.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
-                    throw new ProviderException($"权限不足或密钥无效（HTTP {(int)resp.StatusCode}）——"
+                    throw new ProviderException($"权限不足或密钥无效（HTTP {(int)resp.StatusCode}）{(detail.Length > 0 ? "，接口说：" + detail : "")}——"
                         + "注意：受限 Key 常常只能看到自己创建的 Key 的用量，这类接口不会报错，只会少给数",
                         permanent: true);
 
                 if (resp.StatusCode == HttpStatusCode.NotFound)
-                    throw new ProviderException($"接口路径不存在（HTTP 404）：{cfg.Path}", permanent: true);
+                    throw new ProviderException($"接口路径不存在（HTTP 404）：{cfg.Path}{(detail.Length > 0 ? "，接口说：" + detail : "")}",
+                        permanent: true);
 
                 if (!resp.IsSuccessStatusCode)
-                {
-                    var body = await SafeReadBodyAsync(resp, ct).ConfigureAwait(false);
-                    throw new ProviderException($"HTTP {(int)resp.StatusCode}{(string.IsNullOrEmpty(body) ? "" : "：" + body)}");
-                }
+                    throw new ProviderException($"HTTP {(int)resp.StatusCode}{(detail.Length > 0 ? "：" + detail : "")}");
 
                 var json = await resp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
                 result.BytesIn += Encoding.UTF8.GetByteCount(json);
@@ -540,6 +543,24 @@ public sealed class ProviderClient : IDisposable
         }
 
         return string.Empty;
+    }
+
+    /// <summary>非 2xx 时从响应体里挑出最有用的那句话：能按 JSON 解析就走业务层提炼，
+    /// 解析不了或提炼不出东西才退回截断的原文。把整坨 JSON 塞进提示里用户读不动。</summary>
+    private static async Task<string> ErrorDetailAsync(HttpResponseMessage resp, CancellationToken ct)
+    {
+        var body = await SafeReadBodyAsync(resp, ct).ConfigureAwait(false);
+        if (string.IsNullOrWhiteSpace(body)) return string.Empty;
+
+        try
+        {
+            using var doc = JsonDocument.Parse(body);
+            var biz = ApiBusinessError(doc.RootElement);
+            if (!string.IsNullOrEmpty(biz)) return biz;
+        }
+        catch (JsonException) { }
+
+        return Trunc(body);
     }
 
     private static string? FirstMessage(JsonElement root)
