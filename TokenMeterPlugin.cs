@@ -893,11 +893,14 @@ public sealed class TokenMeterPlugin : IslandPluginBase
                 return;
             }
 
-            var seed = new List<ProviderConfig> { ProviderPresets.All[1].Build() };
-            seed[0].Id = ProviderRegistry.NewId();
-            seed[0].Enabled = false;
-            provStatusText.Text = WriteProvidersFile(seed, out var err)
-                ? "已生成示例配置（未启用）。请把 New-Api-User 等字段填成你自己的值，再把 Enabled 改成 true。"
+            // 写出去的是手写的带注释模板，不是序列化结果 —— 序列化会丢注释，
+            // 而这个文件存在的意义就是给人读、给人改。
+            string? err = null;
+            try { File.WriteAllText(ProvidersPath(), ProviderRegistry.SampleTemplate); }
+            catch (Exception ex) { err = ex.Message; }
+
+            provStatusText.Text = err is null
+                ? "已生成带注释的示例配置。注意 Enabled 是 true，但地址与 New-Api-User 还是占位值，先改成你自己的再保存。"
                 : "生成失败：" + err;
             RenderProviderStatus();
         };
@@ -1228,13 +1231,8 @@ public sealed class TokenMeterPlugin : IslandPluginBase
                 }
                 _providers = reg.Items;
 
-                // 旧版本写出来的是单行、中文还被转义成 \uXXXX，人根本没法读。
-                // 解析成功就顺手规范化一次：内容不变，只是重新序列化。
-                if (!text.Contains('\n'))
-                {
-                    WriteProvidersFile(reg.Items, out _);
-                    Log.Info("providers.json 已重新格式化为缩进可读形式");
-                }
+                // 迁移之后插件**再也不写这个文件**。它一旦能被人手加注释，
+                // 任何自动重写都会把注释抹掉 —— 所以这里只读不写。
                 return _providers;
             }
         }

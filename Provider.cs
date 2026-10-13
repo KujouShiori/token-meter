@@ -441,32 +441,42 @@ public sealed class ProviderRegistry
 
         try
         {
-            if (raw[0] == '[')
+            // 不能靠首字符判断形态：带注释的配置文件开头可能就是 // 而不是 [。
+            // 先按 JSONC 解析一次，再照真正的根类型分派。
+            using var probe = JsonDocument.Parse(raw, JsonDocOpts);
+            switch (probe.RootElement.ValueKind)
             {
-                var list = JsonSerializer.Deserialize<List<ProviderConfig>>(raw, JsonOpts);
-                if (list is null) return null;
-                var reg = new ProviderRegistry { Items = list };
-                reg.EnsureIds();
-                return reg;
-            }
-
-            if (raw[0] == '{')
-            {
-                var one = JsonSerializer.Deserialize<ProviderConfig>(raw, JsonOpts);
-                if (one is null) return null;
-                var reg = new ProviderRegistry { FromLegacyObject = true };
-                reg.Items.Add(one);
-                reg.EnsureIds();
-                return reg;
+                case JsonValueKind.Array:
+                {
+                    var list = JsonSerializer.Deserialize<List<ProviderConfig>>(raw, JsonOpts);
+                    if (list is null) return null;
+                    var reg = new ProviderRegistry { Items = list };
+                    reg.EnsureIds();
+                    return reg;
+                }
+                case JsonValueKind.Object:
+                {
+                    var one = JsonSerializer.Deserialize<ProviderConfig>(raw, JsonOpts);
+                    if (one is null) return null;
+                    var reg = new ProviderRegistry { FromLegacyObject = true };
+                    reg.Items.Add(one);
+                    reg.EnsureIds();
+                    return reg;
+                }
+                default: return null;   // 数字、字符串、null：都不是接口配置
             }
         }
         catch (Exception)
         {
             return null;
         }
-
-        return null;
     }
+
+    private static readonly JsonDocumentOptions JsonDocOpts = new()
+    {
+        CommentHandling = JsonCommentHandling.Skip,
+        AllowTrailingCommas = true,
+    };
 
     /// <summary>给缺 id 的条目补一个，并把重复 id 改掉——同 id 会让两份账本互相覆盖。</summary>
     /// <summary>单接口时代那份配置迁移过来时固定用这个 id，保证跨启动稳定。</summary>
@@ -495,6 +505,65 @@ public sealed class ProviderRegistry
 
     public static string NewId() => Guid.NewGuid().ToString("N")[..12];
 
+    /// <summary>
+    /// 「生成示例配置」写出的模板：手写、带注释，让第一次用的人不必翻文档就知道每个字段干什么。
+    /// ⚠ ProviderConfig 加了新字段时要记得在这里补一行 —— 有断言比对
+    /// 「模板里出现的字段名 ⊆ ProviderConfig 的真实属性」，写了不存在的字段会红，
+    /// 但漏了新字段不会红，只能靠人自觉。
+    /// </summary>
+    public const string SampleTemplate = """
+// providers.json —— 云端用量接口配置
+// 这个文件按 JSONC 读：允许 // 注释和尾逗号。数组里想接几个接口就写几个 { }。
+// 保存即生效（插件每秒检查一次文件有没有变），不用重启宿主。
+// 插件只在「文件还不存在」时写它一次，之后只读不写，所以你加的注释会留着。
+//
+// 密钥不要写在这里：只填环境变量名（ApiKeyEnvVar），插件自己去环境变量取值。
+// 密钥值不进本文件、不进宿主设置、不出现在日志和错误提示里。
+//
+// 下面这份是 New API / One API 网关的写法（实测可用）。换成别家时，
+// 猜错字段名的表现是「数字偏低或拉不到数据」而不是报错，所以先小范围试一天。
+[
+  {
+    "Enabled": true,                                  // false = 完全忽略这个接口，只用本地日志
+    "DisplayName": "我的网关",                          // 岛面和设置页上显示的名字
+    "BaseUrl": "https://ps.air-outer.com",             // 接口根地址，结尾不要带 /
+    "Path": "/api/log/self",                           // 用量查询路径，接在 BaseUrl 后面
+    "AuthHeader": "Authorization",                     // 鉴权头名字（有的家用 x-api-key）
+    "AuthPrefix": "",                                  // 鉴权值前缀，例如 "Bearer "；New API 用裸令牌，留空
+    "ApiKeyEnvVar": "TOKEN_METER_API_KEY",             // 密钥所在的【环境变量名】，不是密钥本身
+    "ExtraHeaders": "New-Api-User=CHANGE_ME",          // 额外固定请求头，多个用分号或换行分隔；把 CHANGE_ME 换成你的用户 ID
+    "StartParam": "start_timestamp",                   // 起始时间参数名
+    "EndParam": "end_timestamp",                       // 结束时间参数名
+    "TimeFormat": "unix",                              // 时间参数格式：date / unix / rfc3339
+    "ExtraQuery": "type=2",                            // 额外固定查询串，原样拼上去（type=2 = 消耗日志）
+    "ItemsPath": "data.items",                         // 条目数组在返回 JSON 里的位置；支持 data[].results 这种两层写法
+    "TimeField": "created_at",                         // 每条记录的时间字段（找不到会去上层对象上找）
+    "ModelField": "model_name",                        // 模型名字段；接口不按模型分组就留空，会归进 ModelFallback
+    "ModelFallback": "未分组",                          // 上面留空时用的组名
+    "InputField": "prompt_tokens",                     // 输入 token 字段
+    "OutputField": "completion_tokens",                // 输出 token 字段
+    "CachedInputField": "other.cache_tokens",          // 缓存命中的输入字段（other 是「字符串里包的 JSON」，能钻进去）
+    "CacheWriteField": "other.cache_creation_tokens",  // 缓存写的字段；支持逗号分隔多个，会相加
+    "InputIncludesCached": true,                       // ⚠ 关键口径：上面的输入是否【已包含】缓存命中。true=输入减掉缓存；false=两者互斥直接相加。减错会整段重复计费，接上后拿一天账单对一次
+    "CostField": "quota",                              // 服务端报回的金额字段；有它就优先用它，省掉按单价推算
+    "CostUnitDivisor": 500000,                         // 金额换算率：字段值 ÷ 这个数 = 元/美元（New API 是 50 万单位 = $1）
+    "Currency": "$",                                   // 这个接口上报的币种。不同币种绝不与本地 ¥ 相加
+    "ModelScope": "",                                  // 这个接口管哪些模型，逗号分隔子串（如 deepseek-, claude-）；留空 = 它报什么就归什么
+    "PageMode": "page",                                // 分页方式：cursor（用返回里的游标）/ page（页码递增）
+    "PageParam": "page",                               // 页码/游标要回填到哪个查询参数上
+    "PageSizeParam": "per_page",                       // page 模式下每页条数的参数名，留空则不传
+    "PageSize": 50,                                    // 每页条数
+    "TotalField": "data.total",                        // 判断翻完没有的总数字段，留空则靠「本页为空/不满一页」停
+    "WindowMaxDays": 1,                                // 单次请求最大时间跨度；逐条日志类接口按 1 天更好翻页
+    "LagMinutes": 10,                                  // 滞后带：晚于「现在 - 该值」的时段不信服务端，继续用本地日志
+    "InitialBackfillDays": 7,                          // 首次（没有水位线时）往回追多少天
+    "TimeoutSeconds": 15,                              // 单次请求超时
+    "ProviderBudgetSeconds": 45,                       // 一轮里这个接口最多花多少秒，超了就本轮先用本地日志，下轮继续
+  }
+]
+
+""";
+
     public string ToJson() => JsonSerializer.Serialize(Items, JsonOpts);
 
     private static readonly JsonSerializerOptions JsonOpts = new()
@@ -505,6 +574,12 @@ public sealed class ProviderRegistry
         WriteIndented = true,
         Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
         PropertyNameCaseInsensitive = true,
+
+        // 标准 JSON 没有注释，所以这里按 JSONC 读：容忍 // 注释与尾逗号，
+        // 让用户能在配置里就地写一行说明。写出时不会带注释 —— 注释能不能留住，
+        // 取决于插件承诺不重写已存在的文件（见 TokenMeterPlugin.LoadProviders）。
+        ReadCommentHandling = JsonCommentHandling.Skip,
+        AllowTrailingCommas = true,
     };
 }
 

@@ -346,5 +346,36 @@ internal static class Program
         var e1 = ProviderRegistry.Parse(explicitId);
         Check("已有显式 id 的不被改动", e1 is not null && e1.Items[0].Id == "mine-1", e1?.Items[0].Id);
         Check("显式 id 的条目不算老配置迁移", e1 is { FromLegacyObject: false }, "不该标 legacy");
+
+        // ---- 注释容忍与示例模板 ----
+        var jsonc = "[\n  // 行注释\n  {\"DisplayName\":\"A\",\"ModelScope\":\"x\",},\n]";
+        var jc = ProviderRegistry.Parse(jsonc);
+        Check("带 // 注释与尾逗号的配置能读进来",
+            jc is not null && jc.Items.Count == 1 && jc.Items[0].DisplayName == "A" && jc.Items[0].ModelScope == "x",
+            jc is null ? "被判成不可读了" : "count=" + jc.Items.Count);
+
+        var tpl = ProviderRegistry.Parse(ProviderRegistry.SampleTemplate);
+        Check("示例模板能被插件自己读通（别写个人家解析不了的文件）",
+            tpl is not null && tpl.Items.Count == 1, "模板读不通");
+        if (tpl is { Items.Count: 1 })
+        {
+            Check("模板里的接口有地址与路径",
+                !string.IsNullOrWhiteSpace(tpl.Items[0].BaseUrl) && !string.IsNullOrWhiteSpace(tpl.Items[0].Path),
+                tpl.Items[0].BaseUrl);
+            Check("模板自己说明了密钥只填环境变量名",
+                ProviderRegistry.SampleTemplate.Contains("环境变量名"), "缺密钥说明");
+
+            var real = typeof(ProviderConfig).GetProperties()
+                .Select(p => p.Name).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            using var doc = System.Text.Json.JsonDocument.Parse(ProviderRegistry.SampleTemplate,
+                new System.Text.Json.JsonDocumentOptions
+                {
+                    CommentHandling = System.Text.Json.JsonCommentHandling.Skip,
+                    AllowTrailingCommas = true,
+                });
+            var bogus = doc.RootElement[0].EnumerateObject()
+                .Select(o => o.Name).Where(n => !real.Contains(n)).ToList();
+            Check("模板里没有 ProviderConfig 不认识的字段", bogus.Count == 0, string.Join(",", bogus));
+        }
     }
 }
