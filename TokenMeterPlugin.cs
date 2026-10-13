@@ -25,10 +25,12 @@ public sealed class TokenMeterPlugin : IslandPluginBase
     private UsageLedger? _lastLedger;
     private Snapshot? _lastSnapshot;
 
-    /// <summary>服务端账本：按天累加，同一轮里只往水位线后面追，不重复拉。</summary>
-    private UsageLedger? _serverLedger;
-    private DateTime? _coveredUntilUtc;
-    private ProviderState _providerState = new();
+    /// <summary>每个接口各自的云端账本与水位线，键 = ProviderConfig.Id。
+    /// 必须分份：共用一个水位线时，A 拉过的区间会把 B 永久遮住，那块数据再也拉不回来。
+    /// 账本要和水位线一起恢复，只恢复水位线等于把已拉区间连同数据一起弄丢。</summary>
+    private readonly Dictionary<string, UsageLedger> _serverLedgers = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, DateTime?> _coveredUntil = new(StringComparer.Ordinal);
+    private MultiProviderState _states = new();
     private string _cacheDir = string.Empty;
 
     /// <summary>上一次成功读到的接口列表。配置读不通时沿用它，并拒绝写回。</summary>
@@ -63,10 +65,7 @@ public sealed class TokenMeterPlugin : IslandPluginBase
         var cacheDir = ResolveCacheDir();
         _cacheDir = cacheDir;
         _scanner = new UsageScanner(cacheDir);
-        _providerState = LoadProviderState();
-        _coveredUntilUtc = _providerState.CoveredUntilUtc;
-        // 云端账本要和水位线一起恢复，否则重启后水位线会遮住已经拉过的数据
-        if (_providerState.HasPersistedLedger) _serverLedger = _providerState.LoadLedger();
+        RestoreProviderState(LoadProviders());
 
         _view = new TokenMeterView(Manifest, Theme);
         _view.SetScanning(true);
@@ -200,8 +199,8 @@ public sealed class TokenMeterPlugin : IslandPluginBase
                     if (!cfg.Enabled)
                     {
                         // 用户主动关掉接口：不能拿旧的服务端数据去压制本地日志
-                        _serverLedger = null;
-                        _coveredUntilUtc = null;
+                        _serverLedgers.Remove(cfg.Id);
+                        _coveredUntil.Remove(cfg.Id);
                     }
 
                     // 先把本地结果立即上屏：接口慢、卡住或在翻页时，界面也不会空着等你。
@@ -222,18 +221,18 @@ public sealed class TokenMeterPlugin : IslandPluginBase
                             catch (ProviderException ex)
                             {
                                 note = "接口不可用，已降级本地日志：" + ex.Message;
-                                RememberProviderFailure(note);
+                                RememberProviderFailure(cfg.Id, note);
                             }
                             catch (Exception ex)
                             {
                                 note = "接口异常，已降级本地日志：" + ex.Message;
-                                RememberProviderFailure(note);
+                                RememberProviderFailure(cfg.Id, note);
                             }
                         }
                         else
                         {
                             note = "接口未就绪（已降级本地日志）：" + why;
-                            RememberProviderFailure(note);
+                            RememberProviderFailure(cfg.Id, note);
                         }
                     }
 
@@ -296,16 +295,16 @@ public sealed class TokenMeterPlugin : IslandPluginBase
         var splitWarning = string.Empty;
         var undercount = false;
         var undercountDetail = string.Empty;
-        var haveServer = cfg.Enabled && _serverLedger is not null && _serverLedger.Days.Count > 0;
+        var haveServer = cfg.Enabled && _serverLedgers.TryGetValue(cfg.Id, out var serverLedger) && serverLedger.Days.Count > 0;
 
         SourceBlock primary;
         if (haveServer)
         {
             var (localPart, serverPart, split) = LedgerSplitter.Split(
-                local, _serverLedger!,
+                local, _serverLedgers[cfg.Id],
                 ModelScope.Parse(Settings.Get("localScope", string.Empty)),
                 ModelScope.Parse(cfg.ModelScope),
-                _coveredUntilUtc, cfg.UndercountWarnPercent);
+                _coveredUntil.GetValueOrDefault(cfg.Id), cfg.UndercountWarnPercent);
 
             // 云端用自己的币种；没拿到 quota 的模型仍回退到本地单价估算
             var serverPricing = PricingConfig.Parse(pricing.ToJson());
@@ -341,7 +340,7 @@ public sealed class TokenMeterPlugin : IslandPluginBase
             SplitNote = splitNote,
             SourceMode = haveServer ? "本地 + 云端（分列）" : "本地日志",
             ProviderSummary = cfg.Enabled ? cfg.SafeSummary() : "服务端接口未启用",
-            CoveredUntilUtc = haveServer ? _coveredUntilUtc : null,
+            CoveredUntilUtc = haveServer ? _coveredUntil.GetValueOrDefault(cfg.Id) : null,
             ProviderNote = note,
             SplitWarning = haveServer ? splitWarning : string.Empty,
             ServerUndercount = undercount,
@@ -362,8 +361,9 @@ public sealed class TokenMeterPlugin : IslandPluginBase
     private async Task PullProviderAsync(ProviderConfig cfg, CancellationToken ct)
     {
         var nowUtc = DateTime.UtcNow;
-        var plan = ProviderClient.PlanWindows(_coveredUntilUtc, nowUtc, cfg);
-        var merged = _serverLedger?.Clone() ?? new UsageLedger();
+        var st = _states.For(cfg.Id);
+        var plan = ProviderClient.PlanWindows(_coveredUntil.GetValueOrDefault(cfg.Id), nowUtc, cfg);
+        var merged = _serverLedgers.TryGetValue(cfg.Id, out var prev) ? prev.Clone() : new UsageLedger();
         var windows = 0;
         var pages = 0;
         long bytes = 0;
@@ -389,17 +389,17 @@ public sealed class TokenMeterPlugin : IslandPluginBase
 
         var advanced = plan.Count > 0
             ? (hitBudget ? plan[Math.Max(0, windows - 1)].To : plan[^1].To)
-            : (_coveredUntilUtc ?? nowUtc.AddMinutes(-cfg.LagMinutes));
+            : (_coveredUntil.GetValueOrDefault(cfg.Id) ?? nowUtc.AddMinutes(-cfg.LagMinutes));
 
-        _serverLedger = merged;
-        _providerState.SaveLedger(merged, cfg.LedgerKeepDays);
-        _coveredUntilUtc = advanced;
-        _providerState.CoveredUntilUtc = advanced;
-        _providerState.LastSuccessUtc = nowUtc;
-        _providerState.LastAttemptUtc = nowUtc;
-        _providerState.LastError = null;
-        _providerState.ServerTotalTokens = merged.TotalTokens();
-        SaveProviderState();
+        _serverLedgers[cfg.Id] = merged;
+        st.SaveLedger(merged, cfg.LedgerKeepDays);
+        _coveredUntil[cfg.Id] = advanced;
+        st.CoveredUntilUtc = advanced;
+        st.LastSuccessUtc = nowUtc;
+        st.LastAttemptUtc = nowUtc;
+        st.LastError = null;
+        st.ServerTotalTokens = merged.TotalTokens();
+        SaveStates();
 
         // 上一轮失败、本轮成功：补一条恢复日志（失败那边的重复告警已做去重）
         if (!string.IsNullOrEmpty(_lastProviderNote))
@@ -410,7 +410,7 @@ public sealed class TokenMeterPlugin : IslandPluginBase
 
         Log.Info($"服务端用量拉取完成：{windows} 段 / {pages} 页 / {Format.Bytes(bytes)}"
                + (hitBudget ? $"（本轮接口预算 {cfg.ProviderBudgetSeconds}s 用完，剩余窗口下轮继续）" : string.Empty)
-               + $"，水位线推到 {advanced:yyyy-MM-dd HH:mm}Z，累计 {Format.Tokens(_providerState.ServerTotalTokens)} token");
+               + $"，水位线推到 {advanced:yyyy-MM-dd HH:mm}Z，累计 {Format.Tokens(st.ServerTotalTokens)} token");
     }
 
     private DateTime? _lastReconcileLogUtc;
@@ -454,11 +454,12 @@ public sealed class TokenMeterPlugin : IslandPluginBase
             + "两种情况都要先排除单价本身填错或该模型未定价。\n" + string.Join("\n", lines));
     }
 
-    private void RememberProviderFailure(string note)
+    private void RememberProviderFailure(string id, string note)
     {
-        _providerState.LastAttemptUtc = DateTime.UtcNow;
-        _providerState.LastError = note;
-        SaveProviderState();
+        var st = _states.For(id);
+        st.LastAttemptUtc = DateTime.UtcNow;
+        st.LastError = note;
+        SaveStates();
 
         // 同一个原因每分钟刷一条 WARN 会把日志埋掉（实测 121 条）：只在原因变化时记
         if (string.Equals(note, _lastProviderNote, StringComparison.Ordinal)) return;
@@ -472,38 +473,69 @@ public sealed class TokenMeterPlugin : IslandPluginBase
         if (!cfg.Enabled)
         {
             // 关掉接口就不能再拿旧的服务端数据压制本地日志
-            _serverLedger = null;
-            _coveredUntilUtc = null;
-            _providerState.CoveredUntilUtc = null;
-            SaveProviderState();
+            _serverLedgers.Remove(cfg.Id);
+            _coveredUntil.Remove(cfg.Id);
+            _states.For(cfg.Id).CoveredUntilUtc = null;
+            SaveStates();
             Log.Info("服务端接口已关闭，回到纯本地日志模式");
         }
         _ = RefreshAsync("接口配置变更");
     }
 
-    private string ProviderStatePath() => Path.Combine(_cacheDir, "provider-state-v1.json");
+    private string StatePathV2() => Path.Combine(_cacheDir, "provider-state-v2.json");
+    private string StatePathV1() => Path.Combine(_cacheDir, "provider-state-v1.json");
 
-    private ProviderState LoadProviderState()
+    /// <summary>读按 id 分份的同步状态。v2 不存在时，把单接口时代的 v1（全局水位线 + 全局账本）
+    /// 迁移到列表第一个接口名下。v1 文件留着不动：迁移只在首次发生，坏了也不影响 v2 读写。</summary>
+    private MultiProviderState LoadStates(IReadOnlyList<ProviderConfig> providers)
     {
         try
         {
-            if (File.Exists(ProviderStatePath()))
-                return ProviderState.Parse(File.ReadAllText(ProviderStatePath()));
+            if (File.Exists(StatePathV2())) return MultiProviderState.Parse(File.ReadAllText(StatePathV2()));
+
+            if (providers.Count > 0 && File.Exists(StatePathV1()))
+            {
+                var legacy = ProviderState.Parse(File.ReadAllText(StatePathV1()));
+                if (legacy.CoveredUntilUtc is not null || legacy.HasPersistedLedger)
+                {
+                    var fresh = new MultiProviderState();
+                    fresh.AdoptLegacy(providers[0].Id, legacy);
+                    Log.Info("已把单接口时代的同步状态迁移到当前接口名下");
+                    return fresh;
+                }
+            }
         }
-        catch (Exception ex) { Log.Warn($"读不到同步水位线（忽略）：{ex.Message}"); }
-        return new ProviderState();
+        catch (Exception ex) { Log.Warn($"读不到同步水位线（忽略，按全新安装处理）：{ex.Message}"); }
+
+        return new MultiProviderState();
     }
 
-    private void SaveProviderState()
+    /// <summary>恢复每个接口各自的账本与水位线。云端账本必须和水位线一起回来：
+    /// 只回水位线的话，它会宣称"这段时间已经拉过了"，而那段时间的数据其实全丢了。</summary>
+    private void RestoreProviderState(IReadOnlyList<ProviderConfig> providers)
+    {
+        _states = LoadStates(providers);
+        _serverLedgers.Clear();
+        _coveredUntil.Clear();
+
+        foreach (var p in providers)
+        {
+            var st = _states.For(p.Id);
+            _coveredUntil[p.Id] = st.CoveredUntilUtc;
+            if (st.HasPersistedLedger) _serverLedgers[p.Id] = st.LoadLedger();
+        }
+    }
+
+    private void SaveStates()
     {
         try
         {
             Directory.CreateDirectory(_cacheDir);
-            File.WriteAllText(ProviderStatePath(), _providerState.ToJson());
+            File.WriteAllText(StatePathV2(), _states.ToJson());
         }
         catch (Exception)
         {
-            // 水位线写不下去只影响下次从哪里续拉，不影响本轮显示
+            // 状态写不下去只影响下次从哪里续拉，不影响本轮显示
         }
     }
 
@@ -1046,10 +1078,10 @@ public sealed class TokenMeterPlugin : IslandPluginBase
             _scanner.ForgetCache();
             // 「完整重扫」必须连云端水位线一起清：否则水位线会遮住本该重拉的那段，
             // 而“完整”两个字就是假的
-            _serverLedger = null;
-            _coveredUntilUtc = null;
-            _providerState = new ProviderState();
-            SaveProviderState();
+            _serverLedgers.Clear();
+            _coveredUntil.Clear();
+            _states = new MultiProviderState();
+            SaveStates();
             Status("已清空缓存（含云端水位线），正在从头重扫…（第一次会慢）");
             _ = RefreshAsync("手动完整重扫");
         };
