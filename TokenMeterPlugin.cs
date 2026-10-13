@@ -288,6 +288,8 @@ public sealed class TokenMeterPlugin : IslandPluginBase
         var blocks = new List<SourceBlock>();
         var splitNote = string.Empty;
         var splitWarning = string.Empty;
+        var undercount = false;
+        var undercountDetail = string.Empty;
         var haveServer = cfg.Enabled && _serverLedger is not null && _serverLedger.Days.Count > 0;
 
         SourceBlock primary;
@@ -296,7 +298,8 @@ public sealed class TokenMeterPlugin : IslandPluginBase
             var (localPart, serverPart, split) = LedgerSplitter.Split(
                 local, _serverLedger!,
                 ModelScope.Parse(Settings.Get("localScope", string.Empty)),
-                ModelScope.Parse(cfg.ModelScope));
+                ModelScope.Parse(cfg.ModelScope),
+                _coveredUntilUtc, cfg.UndercountWarnPercent);
 
             // 云端用自己的币种；没拿到 quota 的模型仍回退到本地单价估算
             var serverPricing = PricingConfig.Parse(pricing.ToJson());
@@ -309,6 +312,11 @@ public sealed class TokenMeterPlugin : IslandPluginBase
             MaybeLogReconcileSample(sb, cfg);
             splitNote = split.Note;
             splitWarning = split.DroppedNote;
+            undercount = split.Undercount;
+            undercountDetail = split.UndercountDetail;
+            // 告警走 ProviderNote 通道：状态行与聚光卡都读它，不必再开第三个显示位
+            if (split.Undercount)
+                note = string.IsNullOrEmpty(note) ? split.UndercountDetail : note + "；" + split.UndercountDetail;
             primary = lb.HasData ? lb : sb;
         }
         else
@@ -330,6 +338,8 @@ public sealed class TokenMeterPlugin : IslandPluginBase
             CoveredUntilUtc = haveServer ? _coveredUntilUtc : null,
             ProviderNote = note,
             SplitWarning = haveServer ? splitWarning : string.Empty,
+            ServerUndercount = undercount,
+            UndercountDetail = undercountDetail,
         };
         SnapshotBuilder.CopyBlock(snap, primary);
         return snap;
@@ -506,7 +516,6 @@ public sealed class TokenMeterPlugin : IslandPluginBase
         }
 
         var snap = ComposeSnapshot(local, pricing, cfg, string.Empty);
-        if (snap.ServerUndercount) snap.ProviderNote = snap.SplitNote;
         Log.Info($"重算快照（{reason}）：今日 {Format.Amount(snap.Today.Cost)}{snap.Currency}，{snap.Blocks.Count} 个来源");
         RunOnUI(() => Apply(snap));
     }

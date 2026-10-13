@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>token-meter-tests</AssemblyName>
+    <RootNamespace>wlverify</RootNamespace>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+  </PropertyGroup>
+
+  <!-- 直接 Compile Include 插件源码本身，而不是引用插件程序集：
+       插件是 WinUI 库、跑不起来，但纯逻辑文件可以单独编译进这个 net10.0 控制台里测。
+       这样测的是真实代码，不是复刻一份。 -->
+  <ItemGroup>
+    <Compile Include="Program.cs" />
+    <Compile Include="ProviderTests.cs" />
+    <Compile Include="..\Format.cs" />
+    <Compile Include="..\Pricing.cs" />
+    <Compile Include="..\Data.cs" />
+    <Compile Include="..\Scanner.cs" />
+    <Compile Include="..\Provider.cs" />
+    <Compile Include="..\ProviderClient.cs" />
+    <Compile Include="..\Reconcile.cs" />
+    <Compile Include="..\Sources.cs" />
+  </ItemGroup>
+</Project>
