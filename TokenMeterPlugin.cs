@@ -852,6 +852,35 @@ public sealed class TokenMeterPlugin : IslandPluginBase
             FontSize = 13,
             Margin = new Thickness(0, 8, 0, 0),
         });
+        // 接口选择器：这里只建控件摆位置，**事件留到所有输入框都声明之后再挂** ——
+        // C# 闭包捕获的是局部变量本身，处理器写在 provScopeBox 等声明之前会引用不到。
+        var providerPicker = new ComboBox
+        {
+            Header = "当前编辑的接口",
+            MinWidth = 320,
+            HorizontalAlignment = HorizontalAlignment.Left,
+        };
+        foreach (var p in provList)
+            providerPicker.Items.Add(string.IsNullOrWhiteSpace(p.DisplayName) ? p.Id : p.DisplayName);
+        providerPicker.SelectedIndex = provList.IndexOf(prov);
+        var addProvider = new Button { Content = "新增接口", VerticalAlignment = VerticalAlignment.Center };
+        var delProvider = new Button { Content = "删除此接口", VerticalAlignment = VerticalAlignment.Center };
+        var pickerStatus = new TextBlock { FontSize = 12, Opacity = 0.8, TextWrapping = TextWrapping.Wrap };
+        var pickerRow = new StackPanel { Orientation = Orientation.Horizontal, Spacing = 12 };
+        pickerRow.Children.Add(providerPicker);
+        pickerRow.Children.Add(addProvider);
+        pickerRow.Children.Add(delProvider);
+        page.Children.Add(Card(pickerRow));
+        page.Children.Add(pickerStatus);
+
+        page.Children.Add(new TextBlock
+        {
+            Text = "每个接口各自独立统计、分列显示，绝不跨币种相加。同一个模型被两个接口同时上报时"
+                 + "谁都不认，会改由本地日志显示并在这里报出来 —— 给其中一个接口设「云端统计哪些模型」来排除。",
+            FontSize = 12,
+            TextWrapping = TextWrapping.Wrap,
+            Opacity = 0.75,
+        });
         page.Children.Add(new TextBlock
         {
             Text = "启用后优先用服务端数据计费与跨设备汇总；接口不可用、超时或权限不足时自动降级回本地日志。"
@@ -1023,6 +1052,94 @@ public sealed class TokenMeterPlugin : IslandPluginBase
             backfillBox.Text = cfg.InitialBackfillDays.ToString(CultureInfo.InvariantCulture);
             jsonBox.Text = cfg.ToJson();
             Status($"已套用「{preset.Name}」（{preset.Basis}）。密钥请自己设进环境变量 {cfg.ApiKeyEnvVar}，插件不保存它。");
+        };
+
+        // ---- 接口选择器的事件（到这里所有输入框都声明完了，闭包才引用得到）----
+
+        void RefillProviderFields()
+        {
+            var list = LoadProviders();
+            var cur = Editing(list);
+            // 必须先改 _editingId 再动控件：provToggle 被程序赋值会触发 Toggled → SetProvider，
+            // 此时目标要是旧接口，就会把旧接口的字段写成新接口的值。
+            // 指向对了之后写进去的就是它自己的值，前后一比对，不会落盘。
+            _editingId = cur.Id;
+
+            providerPicker.Items.Clear();
+            foreach (var p in list)
+                providerPicker.Items.Add(string.IsNullOrWhiteSpace(p.DisplayName) ? p.Id : p.DisplayName);
+            providerPicker.SelectedIndex = list.IndexOf(cur);
+
+            provToggle.IsOn = cur.Enabled;
+            provScopeBox.Text = cur.ModelScope;
+            provCurrencyBox.Text = cur.Currency;
+            baseUrlBox.Text = cur.BaseUrl;
+            pathBox.Text = cur.Path;
+            envBox.Text = cur.ApiKeyEnvVar;
+            provNameBox.Text = cur.DisplayName;
+            winBox.Text = cur.WindowMaxDays.ToString(CultureInfo.InvariantCulture);
+            lagBox.Text = cur.LagMinutes.ToString(CultureInfo.InvariantCulture);
+            backfillBox.Text = cur.InitialBackfillDays.ToString(CultureInfo.InvariantCulture);
+            jsonBox.Text = cur.ToJson();
+        }
+
+        providerPicker.SelectionChanged += (_, _) =>
+        {
+            var i = providerPicker.SelectedIndex;
+            if (i < 0) return;
+            var list = LoadProviders();
+            if (i >= list.Count) return;
+            RefillProviderFields();
+            pickerStatus.Text = $"已切到「{list[i].DisplayName}」，上面那些框现在编辑的就是它。";
+        };
+
+        addProvider.Click += (_, _) =>
+        {
+            var list = LoadProviders();
+            var fresh = new ProviderConfig
+            {
+                Id = ProviderRegistry.NewId(),
+                DisplayName = $"接口 {list.Count + 1}",
+                Enabled = false,               // 新接口默认不联网：没填完就开始发请求只会刷错误
+                ApiKeyEnvVar = "TOKEN_METER_API_KEY",
+            };
+            list.Add(fresh);
+            if (!SaveProviders(list))
+            {
+                pickerStatus.Text = "接口配置当前读不通，没有新增。";
+                return;
+            }
+            RefillProviderFields();
+            pickerStatus.Text = "已新增一个接口（默认未启用）。填好地址、路径并把密钥设进环境变量之后再打开开关。";
+        };
+
+        delProvider.Click += (_, _) =>
+        {
+            var list = LoadProviders();
+            var cur = Editing(list);
+            if (list.Count <= 1)
+            {
+                pickerStatus.Text = "只剩一个接口了：要停用请直接用上面的开关，不要用删除。";
+                return;
+            }
+
+            list.Remove(cur);
+            if (!SaveProviders(list))
+            {
+                pickerStatus.Text = "接口配置当前读不通，没有删除。";
+                return;
+            }
+
+            // 它的内存账本与持久化账本都要跟着走，否则状态文件里留一个再没人读的孤儿
+            _serverLedgers.Remove(cur.Id);
+            _coveredUntil.Remove(cur.Id);
+            _lastProviderNotes.Remove(cur.Id);
+            _lastReconcileLogUtc.Remove(cur.Id);
+            _states.DropOrphans(list.Select(p => p.Id));
+            SaveStates();
+
+            RefillProviderFields();
+            pickerStatus.Text = $"已删除「{cur.DisplayName}」以及它那份云端账本。";
         };
 
         // ---- 模型单价表 ----
