@@ -21,9 +21,9 @@ public sealed class TokenMeterView : UserControl, IMorphView
     private const double ExpandedIconSize = 22;
     private const double CompactCostSize = 15;
     private const double ExpandedCostSize = 19;
-    private const double BaseDetailHeight = 110;
-    private double _detailHeight = BaseDetailHeight;
-    private const int MaxModelRows = 3;
+    /// <summary>展开态 _detail 的目标高度。分配规则（谁让位给谁、为什么是定值）在
+    /// <see cref="IslandLayout.Plan"/> 里，那是个纯函数，有断言盯着"高度不随接口数量增长"。</summary>
+    private double _detailHeight = IslandLayout.BaseHeight;
 
     /// <summary>与宿主内置视图同一条 BackEase 曲线的幅度。</summary>
     private const double BackAmplitude = 0.45;
@@ -177,7 +177,7 @@ public sealed class TokenMeterView : UserControl, IMorphView
             _totals.Text = "";
             _modelRows.Children.Clear();
             _otherHost.Children.Clear();
-            _detailHeight = BaseDetailHeight;
+            _detailHeight = IslandLayout.BaseHeight;
             return;
         }
 
@@ -202,11 +202,17 @@ public sealed class TokenMeterView : UserControl, IMorphView
         var c = s.Today.C;
         _breakdown.Text = $"输入 {Format.Tokens(c.Input)} · 输出 {Format.Tokens(c.Output)} · 缓存读 {Format.Tokens(c.CacheRead)} · {c.Requests} 次请求";
 
+        // 岛面展开态能用的垂直空间是固定的，而「来源数」是这次新长出来的变量。
+        // 高度守恒靠压缩逐模型明细的行数来做，不是加高 —— 规则在 IslandLayout.Plan 里，
+        // 那里是纯函数，能被断言锁住。
+        var (modelCap, rowsToDraw, hiddenSources, detailHeight) =
+            IslandLayout.Plan(Math.Max(0, s.Blocks.Count - 1));
+
         _modelRows.Children.Clear();
         var shown = 0;
         foreach (var m in s.TodayByModel)
         {
-            if (shown >= MaxModelRows) break;
+            if (shown >= modelCap) break;
             _modelRows.Children.Add(MakeRow(m, s.Currency));
             shown++;
         }
@@ -221,12 +227,29 @@ public sealed class TokenMeterView : UserControl, IMorphView
             });
         }
 
-        // 其他来源各一行：岛面空间有限，一个来源只给一行，多了仍然去聚光卡看
+        // 其他来源各一行：一个来源只给一行，装不下的折成一句提示，剩下的去聚光卡看
         _otherHost.Children.Clear();
         var otherRows = 0;
-        for (var i = 1; i < s.Blocks.Count; i++)
+        for (var i = 1; i < s.Blocks.Count && otherRows < rowsToDraw; i++)
         {
             var b = s.Blocks[i];
+
+            if (b.IsSummary)
+            {
+                // 余额型来源：只有「此刻还剩多少」，套用量那套文案会写成「今日无 · 累计 ¥0」，
+                // 既不对也读不出这是个余额
+                var at = b.SummaryAtUtc is null ? string.Empty : $"（{Format.Ago(b.SummaryAtUtc.Value)}更新）";
+                _otherHost.Children.Add(new TextBlock
+                {
+                    Text = $"{b.Name} 余额 {Format.Money(b.Currency, b.SummaryValue!.Value)}{at}",
+                    FontSize = 11.5,
+                    Foreground = _mutedBrush,
+                    TextTrimming = TextTrimming.CharacterEllipsis,
+                });
+                otherRows++;
+                continue;
+            }
+
             var pricedB = b.Today.Models - b.Today.UnpricedModels;
             string costText;
             if (!b.HasData || b.Today.C.Total <= 0)
@@ -245,7 +268,17 @@ public sealed class TokenMeterView : UserControl, IMorphView
             });
             otherRows++;
         }
-        _detailHeight = BaseDetailHeight + otherRows * 16;
+        if (hiddenSources > 0)
+        {
+            _otherHost.Children.Add(new TextBlock
+            {
+                Text = $"…另有 {hiddenSources} 个来源（点岛体看全部）",
+                FontSize = 11,
+                Foreground = _faintBrush,
+            });
+        }
+
+        _detailHeight = detailHeight;
 
         _totals.Text = $"本周 {Format.Money(s.Currency, s.Week.Cost)} · 本月 {Format.Money(s.Currency, s.Month.Cost)} · 累计 {Format.Money(s.Currency, s.All.Cost)}";
     }

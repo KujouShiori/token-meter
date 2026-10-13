@@ -17,6 +17,27 @@ public sealed class ProviderConfig
     public bool Enabled { get; set; }
 
     /// <summary>
+    /// 接口给的是什么数：
+    /// <c>usage</c>（默认）= 逐条/逐天的用量明细，进按天账本与近 7 天柱状图；
+    /// <c>balance</c> = 某一刻的总额（账户余额、剩余额度），只在岛面单独占一行。
+    ///
+    /// 为什么要分开：总额不是流量。把余额塞进按天账本会造出一根巨大的假柱子，
+    /// 而且同一条余额每天都会被再计一次。
+    /// </summary>
+    public string Kind { get; set; } = "usage";
+
+    /// <summary>
+    /// 余额型接口的取值字段（点号路径，支持数组下标 <c>data[0].total_balance</c>、
+    /// 「字符串里包的 JSON」，以及逗号分隔多路径求和——分钱包余额就靠这个）。
+    /// 只有 Kind=balance 时用到。
+    /// </summary>
+    public string BalanceField { get; set; } = "";
+
+    /// <summary>这个接口是「读一个总额」型的。</summary>
+    public bool IsBalance
+        => string.Equals((Kind ?? string.Empty).Trim(), "balance", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
     /// 接口来源的稳定标识。云端账本与水位线按它分份，所以改 DisplayName 不会影响已有数据。
     /// 单接口时代的配置里没有这个字段，反序列化后为空，由 ProviderRegistry.EnsureIds 补。
     /// </summary>
@@ -132,14 +153,17 @@ public sealed class ProviderConfig
     /// <summary>服务端报回的金额字段（点号路径，支持钻进字符串里的 JSON）。</summary>
     public string CostField { get; set; } = "";
 
-    /// <summary>金额换算率：字段值 ÷ 该值 = 元/美元。
-    /// New API 这类用「500000 单位 = $1」的记账法就填 500000。</summary>
+    /// <summary>金额换算率：金额字段的值 ÷ 该值 = 元/美元。
+    /// New API 这类用「500000 单位 = $1」的记账法就填 500000。
+    /// 用量接口作用于 CostField，余额接口作用于 BalanceField（同一个接口只会用到其中一个）。</summary>
     public double CostUnitDivisor { get; set; } = 1;
 
     /// <summary>所有 token 数值的统一乘数。接口返回的不是「个」而是「千/百万」时用它校正，默认 1。</summary>
     public double ValueScale { get; set; } = 1;
 
-    /// <summary>金额字段的乘数（例如接口返回「分」时填 0.01）。默认 1。</summary>
+    /// <summary>金额字段的乘数（例如接口返回「分」时填 0.01）。默认 1。
+    /// 与 CostUnitDivisor 是两回事：一个乘、一个除，两个都给是为了让
+    /// 「50 万单位 = $1」和「数值本身就是分」两种写法都能表达。</summary>
     public double CostScale { get; set; } = 1;
 
     // ---- 拉取节奏 ----
@@ -183,6 +207,8 @@ public sealed class ProviderConfig
             var cfg = JsonSerializer.Deserialize<ProviderConfig>(json, JsonOpts);
             if (cfg is null) return new ProviderConfig();
             cfg.BaseUrl = (cfg.BaseUrl ?? string.Empty).Trim().TrimEnd('/');
+            cfg.Kind = (cfg.Kind ?? string.Empty).Trim();
+            cfg.BalanceField = (cfg.BalanceField ?? string.Empty).Trim();
             if (!string.IsNullOrEmpty(cfg.Path) && !cfg.Path.StartsWith('/')) cfg.Path = "/" + cfg.Path;
             cfg.WindowMaxDays = Math.Clamp(cfg.WindowMaxDays, 1, 366);
             cfg.LagMinutes = Math.Clamp(cfg.LagMinutes, 0, 2880);
@@ -206,6 +232,17 @@ public sealed class ProviderConfig
     public bool IsUsable(out string reason)
     {
         if (!Enabled) { reason = "未启用"; return false; }
+        var kind = (Kind ?? string.Empty).Trim().ToLowerInvariant();
+        if (kind.Length > 0 && kind != "usage" && kind != "balance")
+        {
+            reason = $"Kind「{Kind}」不认识，只支持 usage（按天用量）与 balance（读一个总额）";
+            return false;
+        }
+        if (IsBalance && string.IsNullOrWhiteSpace(BalanceField))
+        {
+            reason = "余额型接口没填取值字段 BalanceField";
+            return false;
+        }
         if (string.IsNullOrWhiteSpace(BaseUrl) || string.IsNullOrWhiteSpace(Path))
         {
             reason = "接口地址未填";
@@ -227,8 +264,10 @@ public sealed class ProviderConfig
 
     /// <summary>只报字段名，绝不报值。</summary>
     public string SafeSummary()
-        => $"{DisplayName}｜{BaseUrl}{Path}｜密钥来自环境变量 {ApiKeyEnvVar}｜窗口≤{WindowMaxDays}天｜滞后{LagMinutes}分钟｜"
-         + $"输入{(InputIncludesCached ? "含" : "不含")}缓存";
+        => $"{DisplayName}｜{(IsBalance ? "余额" : "用量")}｜{BaseUrl}{Path}｜密钥来自环境变量 {ApiKeyEnvVar}｜"
+         + (IsBalance
+            ? $"取值 {BalanceField}"
+            : $"窗口≤{WindowMaxDays}天｜滞后{LagMinutes}分钟｜输入{(InputIncludesCached ? "含" : "不含")}缓存");
 }
 
 /// <summary>一个可套用的接口预设。Basis 说清“这组值哪来的”：没核实的就写未核实，不假装成官方事实。</summary>
@@ -373,6 +412,18 @@ public sealed class ProviderState
     /// </summary>
     public Dictionary<string, Dictionary<string, long[]>> ServerDays { get; set; } = new();
 
+    /// <summary>
+    /// 余额/汇总型接口的最近一次读数（已按 CostUnitDivisor / CostScale 换算成币种单位）。
+    /// null = 还没成功读到过。
+    ///
+    /// ⚠ 它**不进 ServerDays**：余额是「某一刻账户里还剩多少」，不是某一天用了多少。
+    /// 混进按天账本会造出一根巨大的假柱子，并且同一条读数每天被再计一次。
+    /// </summary>
+    public double? LatestBalance { get; set; }
+
+    /// <summary>读数时刻（UTC）。余额没有「覆盖到哪一天」的概念，只有「这是几点看的」。</summary>
+    public DateTime? BalanceAtUtc { get; set; }
+
     public void SaveLedger(UsageLedger? ledger, int keepDays = 0)
     {
         var map = new Dictionary<string, Dictionary<string, long[]>>(StringComparer.Ordinal);
@@ -507,24 +558,29 @@ public sealed class ProviderRegistry
 
     /// <summary>
     /// 「生成示例配置」写出的模板：手写、带注释，让第一次用的人不必翻文档就知道每个字段干什么。
-    /// ⚠ ProviderConfig 加了新字段时要记得在这里补一行 —— 有断言比对
-    /// 「模板里出现的字段名 ⊆ ProviderConfig 的真实属性」，写了不存在的字段会红，
-    /// 但漏了新字段不会红，只能靠人自觉。
+    /// 第一份对象（用量型）把 ProviderConfig 的**全部可写属性**都列出来了，第二份（余额型）只留用得上的——
+    /// 有断言按「两份合起来覆盖所有可写属性」检查，加新字段时不补注释行就会红。
     /// </summary>
     public const string SampleTemplate = """
 // providers.json —— 云端用量接口配置
 // 这个文件按 JSONC 读：允许 // 注释和尾逗号。数组里想接几个接口就写几个 { }。
+// 数组里的顺序就是岛面与聚光卡里的显示顺序：岛面高度只够几行，写在前面的先出现、排在后面的会被折起来。
 // 保存即生效（插件每秒检查一次文件有没有变），不用重启宿主。
 // 插件只在「文件还不存在」时写它一次，之后只读不写，所以你加的注释会留着。
 //
 // 密钥不要写在这里：只填环境变量名（ApiKeyEnvVar），插件自己去环境变量取值。
 // 密钥值不进本文件、不进宿主设置、不出现在日志和错误提示里。
 //
-// 下面这份是 New API / One API 网关的写法（实测可用）。换成别家时，
+// 下面第一份是 New API / One API 网关的写法（实测可用）。换成别家时，
 // 猜错字段名的表现是「数字偏低或拉不到数据」而不是报错，所以先小范围试一天。
+//
+// 第二份是「只读一个总额」的余额型接口（Kind=balance），默认关着当参考：
+// 它不进按天账本、也不进近 7 天柱状图，只在岛面单独占一行。
 [
   {
     "Enabled": true,                                  // false = 完全忽略这个接口，只用本地日志
+    "Kind": "usage",                                  // usage = 逐条/逐天用量（默认）；balance = 只读一个总额，岛面单占一行
+    "Id": "",                                         // 留空则插件按位置自动生成（p0、p1…）。云端账本按这个 id 分份，想改名字又不丢历史就手写一个固定的
     "DisplayName": "我的网关",                          // 岛面和设置页上显示的名字
     "BaseUrl": "https://ps.air-outer.com",             // 接口根地址，结尾不要带 /
     "Path": "/api/log/self",                           // 用量查询路径，接在 BaseUrl 后面
@@ -544,21 +600,49 @@ public sealed class ProviderRegistry
     "OutputField": "completion_tokens",                // 输出 token 字段
     "CachedInputField": "other.cache_tokens",          // 缓存命中的输入字段（other 是「字符串里包的 JSON」，能钻进去）
     "CacheWriteField": "other.cache_creation_tokens",  // 缓存写的字段；支持逗号分隔多个，会相加
+    "RequestsField": "",                               // 请求次数字段；很多接口不给，留空就不显示服务端请求数
+    "ReasoningField": "",                              // 思考 token 字段；只在「输入已含缓存」或它单独计费时才需要填
     "InputIncludesCached": true,                       // ⚠ 关键口径：上面的输入是否【已包含】缓存命中。true=输入减掉缓存；false=两者互斥直接相加。减错会整段重复计费，接上后拿一天账单对一次
+    "ValueScale": 1,                                   // token 数值的统一乘数：接口返回的不是「个」而是「千/百万」时用它校正
     "CostField": "quota",                              // 服务端报回的金额字段；有它就优先用它，省掉按单价推算
-    "CostUnitDivisor": 500000,                         // 金额换算率：字段值 ÷ 这个数 = 元/美元（New API 是 50 万单位 = $1）
+    "CostUnitDivisor": 500000,                         // 金额换算率：金额字段的值 ÷ 这个数 = 元/美元（New API 是 50 万单位 = $1）
+    "CostScale": 1,                                    // 金额字段的乘数（接口返回「分」就填 0.01）。先乘这个、再除上面那个
     "Currency": "$",                                   // 这个接口上报的币种。不同币种绝不与本地 ¥ 相加
     "ModelScope": "",                                  // 这个接口管哪些模型，逗号分隔子串（如 deepseek-, claude-）；留空 = 它报什么就归什么
     "PageMode": "page",                                // 分页方式：cursor（用返回里的游标）/ page（页码递增）
     "PageParam": "page",                               // 页码/游标要回填到哪个查询参数上
+    "PageStart": 0,                                    // page 模式的起始页码（有的接口从 0 开始，有的从 1 开始）
     "PageSizeParam": "per_page",                       // page 模式下每页条数的参数名，留空则不传
     "PageSize": 50,                                    // 每页条数
     "TotalField": "data.total",                        // 判断翻完没有的总数字段，留空则靠「本页为空/不满一页」停
+    "PageTokenField": "",                              // cursor 模式用：返回里的下一页游标字段名，留空表示不分页（page 模式下看不到它）
+    "HasMoreField": "",                                // cursor 模式用：有没有下一页的布尔字段，false 就停
+    "LimitParam": "",                                  // 每次请求最多要多少个时间桶的参数名；靠这个限制返回量的接口才需要填
+    "LimitPerRequest": 0,                              // 上面那个参数的值，0 = 不传
     "WindowMaxDays": 1,                                // 单次请求最大时间跨度；逐条日志类接口按 1 天更好翻页
+    "MaxWindowsPerRun": 12,                            // 一轮最多拉多少个时间窗口，防止首次同步把界面卡死
+    "MaxPagesPerWindow": 50,                           // 单个窗口内最多翻多少页，超了就报错停下来
     "LagMinutes": 10,                                  // 滞后带：晚于「现在 - 该值」的时段不信服务端，继续用本地日志
     "InitialBackfillDays": 7,                          // 首次（没有水位线时）往回追多少天
     "TimeoutSeconds": 15,                              // 单次请求超时
     "ProviderBudgetSeconds": 45,                       // 一轮里这个接口最多花多少秒，超了就本轮先用本地日志，下轮继续
+    "LedgerKeepDays": 730,                             // 云端账本在缓存里保留多少天，超出的整天丢掉。0 = 不清理
+    "UndercountWarnPercent": 10,                       // 云端报的总量比本地日志少超过这个百分比时，界面标警告（多半是这个 Key 权限不全，看不见全部来源）
+  },
+  {
+    "Enabled": false,                                  // 想看效果就改成 true；上面那个接口的密钥环境变量这里同样能用
+    "Kind": "balance",                                 // ← 余额型接口靠这一行区分：它只在岛面单独占一行
+    "DisplayName": "我的账户余额",                       // 岛面那一行开头显示的名字
+    "BaseUrl": "https://api.example.com",              // 接口根地址，结尾不要带 /
+    "Path": "/v1/wallet/balance",                      // 余额接口通常不带时间参数，所以 StartParam/EndParam 在这里不会被拼上去
+    "AuthHeader": "Authorization",                     // 鉴权头名字（有的家用 x-api-key）
+    "AuthPrefix": "Bearer ",                           // 鉴权值前缀，注意末尾空格；留空则整个头的值就是密钥本身
+    "ApiKeyEnvVar": "TOKEN_METER_API_KEY",             // 密钥所在的【环境变量名】，不是密钥本身
+    "BalanceField": "data[0].total_balance",           // 取值路径：支持点号、数组下标、钻进「字符串里包的 JSON」；逗号分隔多个会求和（分钱包余额）。值写成 "3.5" 这种字符串也认
+    "CostUnitDivisor": 1,                              // 余额也是金额，所以复用同一个换算率（比如 50 万单位 = $1 的记账法就填 500000）
+    "CostScale": 1,                                    // 金额字段的乘数（接口返回「分」就填 0.01）
+    "Currency": "$",                                   // 这个数是什么币种
+    "TimeoutSeconds": 15,                              // 单次请求超时
   }
 ]
 

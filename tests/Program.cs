@@ -28,6 +28,9 @@ internal static class Program
         UndercountTests();
         SplitManyTests();
         RegistryTests();
+        DayPointTests();
+        IslandLayoutTests();
+        BalanceTests();
 
         Console.WriteLine($"[Program] {_pass} 过 / {_fail} 败");
         var providerFailures = await ProviderTests.RunAsync();
@@ -330,7 +333,7 @@ internal static class Program
             l1 is not null && again is not null && l1.Items[0].Id == again.Items[0].Id,
             $"{l1?.Items[0].Id} vs {again?.Items[0].Id}");
         Check("老配置固定用 legacy-primary 这个 id",
-            again is not null && again.Items[0].Id == ProviderRegistry.LegacyId, again?.Items[0].Id);
+            again is not null && again.Items[0].Id == ProviderRegistry.LegacyId, again?.Items[0].Id ?? "null");
         Check("标记出这是从单个对象迁移来的", again is { FromLegacyObject: true }, "没标记");
 
         var noIdArr = "[{\"DisplayName\":\"A\"},{\"DisplayName\":\"B\"}]";
@@ -344,7 +347,7 @@ internal static class Program
 
         var explicitId = "[{\"Id\":\"mine-1\",\"DisplayName\":\"A\"}]";
         var e1 = ProviderRegistry.Parse(explicitId);
-        Check("已有显式 id 的不被改动", e1 is not null && e1.Items[0].Id == "mine-1", e1?.Items[0].Id);
+        Check("已有显式 id 的不被改动", e1 is not null && e1.Items[0].Id == "mine-1", e1?.Items[0].Id ?? "null");
         Check("显式 id 的条目不算老配置迁移", e1 is { FromLegacyObject: false }, "不该标 legacy");
 
         // ---- 注释容忍与示例模板 ----
@@ -356,26 +359,239 @@ internal static class Program
 
         var tpl = ProviderRegistry.Parse(ProviderRegistry.SampleTemplate);
         Check("示例模板能被插件自己读通（别写个人家解析不了的文件）",
-            tpl is not null && tpl.Items.Count == 1, "模板读不通");
-        if (tpl is { Items.Count: 1 })
+            tpl is not null && tpl.Items.Count == 2, $"模板读不通或条目数变了：count={tpl?.Items.Count}");
+        if (tpl is { Items.Count: 2 })
         {
             Check("模板里的接口有地址与路径",
                 !string.IsNullOrWhiteSpace(tpl.Items[0].BaseUrl) && !string.IsNullOrWhiteSpace(tpl.Items[0].Path),
                 tpl.Items[0].BaseUrl);
             Check("模板自己说明了密钥只填环境变量名",
                 ProviderRegistry.SampleTemplate.Contains("环境变量名"), "缺密钥说明");
+            Check("模板第二份是余额型示范，且默认关着（不能一生成就去联网）",
+                tpl.Items[1].IsBalance && !tpl.Items[1].Enabled, $"kind={tpl.Items[1].Kind} enabled={tpl.Items[1].Enabled}");
+            Check("模板第一份是按天用量型",
+                !tpl.Items[0].IsBalance && tpl.Items[0].Enabled, tpl.Items[0].Kind);
+            Check("两个示例接口拿到不同的自动 id（同 id 会让两份账本互相覆盖）",
+                tpl.Items[0].Id != tpl.Items[1].Id && !string.IsNullOrWhiteSpace(tpl.Items[0].Id),
+                $"{tpl.Items[0].Id}/{tpl.Items[1].Id}");
 
-            var real = typeof(ProviderConfig).GetProperties()
-                .Select(p => p.Name).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var props = typeof(ProviderConfig).GetProperties().Select(p => p.Name).ToHashSet(StringComparer.OrdinalIgnoreCase);
             using var doc = System.Text.Json.JsonDocument.Parse(ProviderRegistry.SampleTemplate,
                 new System.Text.Json.JsonDocumentOptions
                 {
                     CommentHandling = System.Text.Json.JsonCommentHandling.Skip,
                     AllowTrailingCommas = true,
                 });
-            var bogus = doc.RootElement[0].EnumerateObject()
-                .Select(o => o.Name).Where(n => !real.Contains(n)).ToList();
+            var written = new List<string>();
+            foreach (var obj in doc.RootElement.EnumerateArray())
+                foreach (var o in obj.EnumerateObject()) written.Add(o.Name);
+
+            var bogus = written.Where(n => !props.Contains(n)).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
             Check("模板里没有 ProviderConfig 不认识的字段", bogus.Count == 0, string.Join(",", bogus));
+
+            // 反方向也查：以前只能查出「写了不存在的字段」，查不出「加了字段忘了写进示例」，
+            // 而后者才是真会发生的（配置文件是用户唯一的接口入口，看不见的字段等于没有）
+            var writable = typeof(ProviderConfig).GetProperties()
+                .Where(p => p.CanWrite && p.GetIndexParameters().Length == 0)
+                .Select(p => p.Name).ToList();
+            var missing = writable.Where(n => !written.Contains(n, StringComparer.OrdinalIgnoreCase)).ToList();
+            Check("ProviderConfig 的每个可写字段都在示例里出现过（加字段必须同步补模板）",
+                missing.Count == 0, "示例里看不到：" + string.Join(",", missing));
+
+            // 注释才是这个文件存在的理由：只有字段名没有说明，第一次用的人照样配不出来。
+            // 判据用 " // "（前后都有空格）而不是 "//"：BaseUrl 的值里就带 https://，
+            // 用裸 "//" 会把每个接口地址都误判成"已有注释"。
+            var fieldLines = ProviderRegistry.SampleTemplate.Split('\n')
+                .Select(l => l.Trim())
+                .Where(l => l.StartsWith("\"") && l.Contains(':'))
+                .ToList();
+            var uncommented = fieldLines.Where(l => !l.Contains(" // ")).ToList();
+            Check("示例里每一行配置都跟着说明（这是用户唯一的接口入口）",
+                fieldLines.Count > 0 && uncommented.Count == 0,
+                $"共 {fieldLines.Count} 行，没说明的：" + string.Join(" | ", uncommented));
         }
+    }
+
+    // ---------------- 近 7 天单日汇总 ----------------
+
+    /// <summary>
+    /// DayPoint 是把「一天里所有模型」压成一个点给柱状图用的，所以跨模型的金额必须是累加。
+    /// 这条用例是本地假接口实机撞出来的：那个多模型来源一天报了 0.012 + 0.004，
+    /// 图上的金额却只有 0.004 —— 写成赋值时最后一个模型把前面全覆盖了，
+    /// 而单模型账号（只有一个 deepseek 的场合）完全看不出来。
+    /// </summary>
+    private static void DayPointTests()
+    {
+        var today = Format.DayKey(DateOnly.FromDateTime(DateTime.Now));
+        var l = new UsageLedger();
+        l.Add(today, "m-a", new Counters { Input = 1200, Output = 300, Total = 1500, Src = 1, CostUnits = 1200000 });
+        l.Add(today, "m-b", new Counters { Input = 400, Output = 80, Total = 480, Src = 1, CostUnits = 400000 });
+
+        var pricing = PricingConfig.Parse("{\"Currency\":\"\u00a5\",\"PerTokens\":1000000,\"Models\":[]}");
+        var p = SnapshotBuilder.BuildBlock(l, pricing, "测试").Last7[^1];
+
+        Check("同一天多个模型的服务端金额必须累加（赋值会被最后一个覆盖）",
+            Math.Abs((double)p.ServerCost - 0.016) < 1e-9, $"ServerCost={p.ServerCost}");
+        Check("同一天多个模型的 token 也累加", p.Total == 1980, $"Total={p.Total}");
+        Check("带服务端金额的多模型不算「未定价」", !p.HasUnpriced, "被标成未定价了");
+
+        var one = new UsageLedger();
+        one.Add(today, "m-only", new Counters { Input = 100, Total = 100, Src = 1, CostUnits = 700000 });
+        var p1 = SnapshotBuilder.BuildBlock(one, pricing, "测试").Last7[^1];
+        Check("单模型时行为和改之前一致（这条保证没有回归）",
+            Math.Abs((double)p1.ServerCost - 0.007) < 1e-9, $"ServerCost={p1.ServerCost}");
+    }
+
+    // ---------------- 岛面展开态的行数分配 ----------------
+
+    /// <summary>
+    /// 岛面展开高度是个硬预算，而来源数由用户随便加。这段算术从视图里抽出来就是为了能这样查：
+    /// 「接到第 8 个接口时岛面会不会溢出一截」不能靠人眼在展开态上一格一格数。
+    /// </summary>
+    private static void IslandLayoutTests()
+    {
+        var noSource = IslandLayout.Plan(0);
+        Check("没有云端来源时高度就是基线值",
+            noSource.DetailHeight == IslandLayout.BaseHeight
+            && noSource.ModelRows == IslandLayout.MaxModelRows && noSource.OtherRowsToDraw == 0,
+            $"h={noSource.DetailHeight} m={noSource.ModelRows} o={noSource.OtherRowsToDraw}");
+
+        var one = IslandLayout.Plan(1);
+        Check("一个来源：三行模型明细一行来源（和不接云端时同高的算法一致）",
+            one.ModelRows == 3 && one.OtherRowsToDraw == 1 && one.OtherHidden == 0,
+            $"m={one.ModelRows} o={one.OtherRowsToDraw}");
+
+        var three = IslandLayout.Plan(3);
+        Check("三个来源：模型明细让到只剩一行，来源各占一行",
+            three.ModelRows == 1 && three.OtherRowsToDraw == 3 && three.OtherHidden == 0,
+            $"m={three.ModelRows} o={three.OtherRowsToDraw} h={three.DetailHeight}");
+
+        var six = IslandLayout.Plan(6);
+        Check("六个来源：折成一句提示，而不是把岛撑高",
+            six.OtherRowsToDraw == 2 && six.OtherHidden == 4
+            && six.DetailHeight == three.DetailHeight,
+            $"drawn={six.OtherRowsToDraw} hidden={six.OtherHidden} h={six.DetailHeight} vs {three.DetailHeight}");
+
+        // 核心不变式：来源再多，展开高度与行数都不能涨
+        var maxHeight = 0d;
+        var maxOtherLines = 0;
+        var minModelRows = 99;
+        for (var n = 0; n <= 40; n++)
+        {
+            var p = IslandLayout.Plan(n);
+            if (p.DetailHeight > maxHeight) maxHeight = p.DetailHeight;
+            if (p.OtherRowsToDraw + (p.OtherHidden > 0 ? 1 : 0) > maxOtherLines)
+                maxOtherLines = p.OtherRowsToDraw + (p.OtherHidden > 0 ? 1 : 0);
+            if (n > 0 && p.ModelRows < minModelRows) minModelRows = p.ModelRows;
+            if (p.OtherRowsToDraw + p.OtherHidden != n)
+            {
+                Check($"来源数对得上（n={n}）", false, $"{p.OtherRowsToDraw}+{p.OtherHidden}≠{n}");
+                return;
+            }
+        }
+        Check("40 个来源里最大展开高度也不超过基线 + 一行",
+            maxHeight <= IslandLayout.BaseHeight + IslandLayout.RowHeight + 0.001,
+            $"max={maxHeight} vs {IslandLayout.BaseHeight + IslandLayout.RowHeight}");
+        Check("来源区最多占 MaxOtherLines 行（含那句提示）",
+            maxOtherLines <= IslandLayout.MaxOtherLines, $"实际 {maxOtherLines} 行");
+        Check("逐模型明细永远至少留一行（不能全被云端挤没）",
+            minModelRows >= 1, $"最少时 {minModelRows} 行");
+
+        var negative = IslandLayout.Plan(-5);
+        Check("来源数为负当 0 处理（视图传错了不该算出负高度）",
+            negative.DetailHeight == IslandLayout.BaseHeight && negative.OtherHidden == 0,
+            $"h={negative.DetailHeight} hidden={negative.OtherHidden}");
+
+        // ---- 谁占那几行：按接口文件里的书写顺序 ----
+        // byId 故意用和顺序表不同的插入顺序建，这样"结果按谁排"才测得出来
+        var local = new SourceBlock { Name = "本地日志" };
+        var byId = new Dictionary<string, SourceBlock>(StringComparer.Ordinal)
+        {
+            ["c-balance"] = new SourceBlock { Name = "余额", SummaryValue = 1m },
+            ["c-usage2"] = new SourceBlock { Name = "第二家用量" },
+            ["c-usage1"] = new SourceBlock { Name = "第一家用量" },
+        };
+        var ordered = SnapshotBuilder.OrderBlocks(
+            new[] { "c-usage1", "c-balance", "c-usage2" }, local, byId);
+
+        Check("本地块永远在第一位（视图拿 Blocks[0] 当主块显示岛面标题）",
+            ordered.Count == 4 && ordered[0].Name == "本地日志",
+            string.Join(",", ordered.Select(x => x.Name)));
+        Check("其余按配置文件里的书写顺序排，余额不再被挤到最后",
+            ordered[1].Name == "第一家用量" && ordered[2].Name == "余额" && ordered[3].Name == "第二家用量",
+            string.Join(",", ordered.Select(x => x.Name)));
+
+        var withDead = SnapshotBuilder.OrderBlocks(
+            new[] { "c-off", "c-balance", "c-usage1" }, local, byId);
+        Check("没拿到数据的接口跳过：不报错、也不画空块占位",
+            withDead.Count == 3 && withDead[1].Name == "余额" && withDead[2].Name == "第一家用量",
+            string.Join(",", withDead.Select(x => x.Name)));
+
+        Check("顺序表为空时只剩本地块（所有接口都关掉的那一轮）",
+            SnapshotBuilder.OrderBlocks(Array.Empty<string>(), local, byId).Count == 1, "多了东西");
+    }
+
+    // ---------------- 余额/汇总型接口 ----------------
+
+    /// <summary>
+    /// Kind=balance 的配置层口径。视图与取数的用例在 ProviderTests 那边跑真接口，
+    /// 这里锁的是「什么算配好了」和「余额绝不进按天账本」这两条规则。
+    /// </summary>
+    private static void BalanceTests()
+    {
+        var usage = new ProviderConfig { Enabled = true, BaseUrl = "https://a", Path = "/x", BalanceField = "b" };
+        Environment.SetEnvironmentVariable("WL_BAL_KEY", "v");
+        usage.ApiKeyEnvVar = "WL_BAL_KEY";
+        Check("Kind 默认就是按天用量型", !usage.IsBalance, usage.Kind);
+
+        var typed = new ProviderConfig
+        {
+            Enabled = true, BaseUrl = "https://a", Path = "/x",
+            ApiKeyEnvVar = "WL_BAL_KEY", BalanceField = "data.balance",
+        };
+        typed.Kind = "  BALANCE  ";
+        Check("Kind 认大小写与首尾空格", typed.IsBalance, $"「{typed.Kind}」没被认成 balance");
+        Check("余额型接口的就绪提示里没有「未就绪」", typed.IsUsable(out _), "配齐了却报未就绪");
+
+        var noField = new ProviderConfig
+        {
+            Enabled = true, BaseUrl = "https://a", Path = "/x", ApiKeyEnvVar = "WL_BAL_KEY",
+            Kind = "balance", BalanceField = "",
+        };
+        Check("余额型没填取值字段要说 BalanceField（不然只能看到「拉不到数」）",
+            !noField.IsUsable(out var why1) && why1.Contains("BalanceField"), why1);
+
+        var typo = new ProviderConfig
+        {
+            Enabled = true, BaseUrl = "https://a", Path = "/x", ApiKeyEnvVar = "WL_BAL_KEY",
+            Kind = "banlance", BalanceField = "data.balance",
+        };
+        Check("Kind 拼错必须报错，不能悄悄当 usage 跑",
+            !typo.IsUsable(out var why2) && why2.Contains("不认识"), why2);
+        Check("Kind 拼错的提示里给出两个合法值",
+            why2.Contains("usage") && why2.Contains("balance"), why2);
+
+        Check("摘要里标明这是余额接口、用量接口仍标用量",
+            typed.SafeSummary().Contains("｜余额｜") && usage.SafeSummary().Contains("｜用量｜"),
+            typed.SafeSummary() + " || " + usage.SafeSummary());
+
+        // 余额的存放位置本身就是设计决定：它不是任何一天的用量
+        var st = new ProviderState
+        {
+            LatestBalance = 249.9,
+            BalanceAtUtc = new DateTime(2026, 10, 14, 3, 4, 5, DateTimeKind.Utc),
+        };
+        var back = ProviderState.Parse(st.ToJson());
+        Check("余额读数能存能取回来", back.LatestBalance is > 249.89 and < 249.91, $"{back.LatestBalance}");
+        Check("余额带着它是几点看的", back.BalanceAtUtc == st.BalanceAtUtc, $"{back.BalanceAtUtc}");
+        Check("余额没有混进按天账本", !back.HasPersistedLedger, "ServerDays 里冒出东西了");
+
+        var fresh = ProviderState.Parse("{}");
+        Check("旧状态文件没有这两个字段时读成 null，不是 0",
+            fresh.LatestBalance is null && fresh.BalanceAtUtc is null, $"{fresh.LatestBalance}");
+
+        var zero = new SourceBlock { Currency = "$", SummaryValue = 0m };
+        Check("余额 0 也是有效读数（区别于「没取到」）", zero.IsSummary, "0 被当成没有余额了");
+        Check("没有余额读数的来源不算汇总型", !new SourceBlock().IsSummary, "默认值就被认成余额了");
     }
 }

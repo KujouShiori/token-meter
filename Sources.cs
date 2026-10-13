@@ -63,6 +63,23 @@ public sealed class SourceBlock
     public bool HasData { get; set; }
     public int LedgerDays { get; set; }
     public string Note { get; set; } = "";
+
+    /// <summary>
+    /// 汇总型来源（Kind=balance）的读数，已换算到 <see cref="Currency"/> 单位。
+    /// null = 这个来源是按天流量。
+    ///
+    /// 它刻意<b>不</b>进 <see cref="Today"/>/<see cref="All"/>/<see cref="Last7"/>：
+    /// 余额是「此刻还剩多少」，不是「某天用了多少」。塞进按天结构会同时犯两个错——
+    /// 柱状图里多出一根按总额刻度的假巨柱，并且同一笔余额每天被再计一次。
+    /// 视图必须把它当独立的一行画。
+    /// </summary>
+    public decimal? SummaryValue { get; set; }
+
+    /// <summary>读数额外的信息：这是几点看到的（本地时间由视图自己转）。</summary>
+    public DateTime? SummaryAtUtc { get; set; }
+
+    /// <summary>这个来源是「读一个总额」型的，不参与按天统计与柱状图。</summary>
+    public bool IsSummary => SummaryValue is not null;
 }
 
 /// <summary>分派结果说明，用于在界面上交代「哪些模型被划给了云端」。</summary>
@@ -84,6 +101,42 @@ public sealed class SplitInfo
     public bool Undercount { get; set; }
     /// <summary>低估值告警正文。显示走 ProviderNote 通道（状态行与聚光卡都读它）。</summary>
     public string UndercountDetail { get; set; } = "";
+}
+
+/// <summary>
+/// 岛面展开态的行数分配。抽成纯函数是因为这段算术在 WinUI 里，测试工程碰不到视图，
+/// 而"接的接口越多岛面越高"这种毛病只有把数字算出来才守得住。
+///
+/// 展开态能用的垂直空间是固定的（ExpandedSize 高 188，还要扣掉标题行、内边距和间距，
+/// 真正留给明细的只有一百三十几像素），而来源数是用户想接几个就接几个的。
+/// 所以<b>每多占一行来源就让出一行逐模型明细</b>：总高度是个定值。
+/// 直接加高不行——每多接一个接口岛就溢出一截，而且展开动画的目标高度会在中途变化，
+/// 视觉上像跳一下。
+/// </summary>
+public static class IslandLayout
+{
+    public const int MaxModelRows = 3;
+    public const int MaxOtherLines = 3;
+    public const double BaseHeight = 110;
+    public const double RowHeight = 16;
+
+    /// <summary>
+    /// <param name="sourceCount">除本地块以外还有几个来源（本地块自己占标题行与逐模型明细，不算在这里）。</param>
+    /// <returns>ModelRows 逐模型明细画几行；OtherRowsToDraw 来源行画几行；
+    /// OtherHidden 被折进提示的来源数；DetailHeight 展开态 _detail 的目标高度。</returns>
+    public static (int ModelRows, int OtherRowsToDraw, int OtherHidden, double DetailHeight) Plan(int sourceCount)
+    {
+        var n = Math.Max(0, sourceCount);
+        var otherLines = Math.Min(n, MaxOtherLines);
+        var modelRows = Math.Max(1, MaxModelRows - Math.Max(0, otherLines - 1));
+
+        // 装不下的时候要留一行给「…另有 N 个来源」，所以少画一行而不是多画一行
+        var drawn = n > otherLines ? Math.Max(0, otherLines - 1) : otherLines;
+        var lines = drawn + (n > drawn ? 1 : 0);
+        var height = BaseHeight + lines * RowHeight - (MaxModelRows - modelRows) * RowHeight;
+
+        return (modelRows, drawn, n - drawn, height);
+    }
 }
 
 /// <summary>

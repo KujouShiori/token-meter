@@ -18,6 +18,18 @@ public sealed class ProviderException : Exception
     }
 }
 
+public sealed class ProviderBalanceResult
+{
+    /// <summary>换算成币种单位后的读数（已 ÷ CostUnitDivisor、× CostScale）。</summary>
+    public decimal Amount { get; set; }
+
+    /// <summary>接口**原样**报回的数值，没换算过。只进日志，用来核对换算率填错了没有
+    /// ——「余额看着是 249 但实际 $0.0005」这种，看原值一眼就能定位。</summary>
+    public double RawValue { get; set; }
+
+    public long Bytes { get; set; }
+}
+
 public sealed class ProviderFetchResult
 {
     public UsageLedger Ledger { get; } = new();
@@ -36,15 +48,18 @@ public sealed class ProviderFetchResult
 }
 
 /// <summary>
-/// 通用「OpenAI 风格」用量接口客户端。
+/// 通用服务商接口客户端，两种形态：
+///   · FetchAsync —— 逐条/逐天的用量明细，走时间窗口 + 分页；
+///   · FetchBalanceAsync —— 只读一个总额（余额/剩余额度），不分页、不带时间参数。
 ///
-/// 三件事按用户要求处理：
+/// 用量侧三件事按用户要求处理：
 ///   1. 分页：PageTokenField 非空就一直翻，受 MaxPagesPerWindow 上限保护；
 ///   2. 时间窗口：从水位线滚到「现在 - 滞后带」，跨度超过 WindowMaxDays 就切段，
 ///      一轮最多 MaxWindowsPerRun 段，避免首次同步把界面卡死；
 ///   3. 字段口径：InputIncludesCached 决定缓存部分是从输入里减出来还是直接相加。
 ///
 /// 所有字段名与限制都来自 ProviderConfig，代码里不写死任何厂商数值。
+/// 两种形态共用同一个 SendJsonAsync，鉴权与错误处理只有一份。
 /// </summary>
 public sealed class ProviderClient : IDisposable
 {
@@ -64,11 +79,7 @@ public sealed class ProviderClient : IDisposable
     public async Task<ProviderFetchResult> FetchAsync(
         ProviderConfig cfg, DateTime fromUtc, DateTime toUtc, CancellationToken ct)
     {
-        if (!cfg.IsUsable(out var why)) throw new ProviderException(why, permanent: true);
-
-        var key = Environment.GetEnvironmentVariable(cfg.ApiKeyEnvVar.Trim()) ?? string.Empty;
-        if (string.IsNullOrWhiteSpace(key))
-            throw new ProviderException($"环境变量 {cfg.ApiKeyEnvVar.Trim()} 没有值", permanent: true);
+        var key = ResolveKey(cfg);
 
         var result = new ProviderFetchResult { CoveredUntilUtc = toUtc };
         var pageMode = string.Equals(cfg.PageMode, "page", StringComparison.OrdinalIgnoreCase);
@@ -80,148 +91,286 @@ public sealed class ProviderClient : IDisposable
         {
             ct.ThrowIfCancellationRequested();
 
-            var url = BuildUrl(cfg, fromUtc, toUtc, cursor)
-                .Replace("{base}", cfg.BaseUrl, StringComparison.Ordinal);
-            // 少数接口把密钥放在查询参数里（例如 Gemini 的 ?key=…），这里才做 {key} 替换；
-            // 替换完再跑安全校验，保证真正要发出去的那个地址是安全文的
-            url = url.Replace("{key}", Uri.EscapeDataString(key), StringComparison.Ordinal);
-            AssertSafeUrl(url);
+            var url = ResolveUrl(cfg, BuildUrl(cfg, fromUtc, toUtc, cursor), key);
+            var (doc, bytes) = await SendJsonAsync(cfg, url, key, ct).ConfigureAwait(false);
+            result.BytesIn += bytes;
 
-            using var req = new HttpRequestMessage(HttpMethod.Get, url);
-
-            // 只加一个鉴权头；头名和前缀都可配，不假设任何厂商写法
-            var headerValue = string.IsNullOrEmpty(cfg.AuthPrefix) ? key : cfg.AuthPrefix + key;
-            if (!TryAddHeader(req, cfg.AuthHeader, headerValue, out var headerError))
-                throw new ProviderException(headerError, permanent: true);
-
-            // 部分接口除了鉴权头还强制要求版本头（例如 anthropic-version）
-            foreach (var (hk, hv) in ParseExtraHeaders(cfg.ExtraHeaders))
-                req.Headers.TryAddWithoutValidation(hk, hv);
-
-            HttpResponseMessage resp;
-            try
+            using (doc)
             {
-                resp = await _http.SendAsync(req, HttpCompletionOption.ResponseContentRead, ct).ConfigureAwait(false);
-            }
-            catch (TaskCanceledException) when (!ct.IsCancellationRequested)
-            {
-                throw new ProviderException($"请求超时（{cfg.TimeoutSeconds}s）");
-            }
-            catch (HttpRequestException ex)
-            {
-                throw new ProviderException($"连不上接口：{ex.Message}");
-            }
+                var root = doc.RootElement;
 
-            using (resp)
-            {
-                // 非 2xx 也先读一次 body：401/403/404 的响应体里常常正好写着那句能定位问题的话
-                var detail = resp.IsSuccessStatusCode
-                    ? string.Empty
-                    : await ErrorDetailAsync(resp, ct).ConfigureAwait(false);
+                var (resolved, pairs) = EnumerateItems(root, cfg.ItemsPath);
+                if (!resolved)
+                    throw new ProviderException($"在返回里找不到条目数组「{cfg.ItemsPath}」——请改 ItemsPath", permanent: true);
 
-                if (resp.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
-                    throw new ProviderException($"权限不足或密钥无效（HTTP {(int)resp.StatusCode}）{(detail.Length > 0 ? "，接口说：" + detail : "")}——"
-                        + "注意：受限 Key 常常只能看到自己创建的 Key 的用量，这类接口不会报错，只会少给数",
-                        permanent: true);
-
-                if (resp.StatusCode == HttpStatusCode.NotFound)
-                    throw new ProviderException($"接口路径不存在（HTTP 404）：{cfg.Path}{(detail.Length > 0 ? "，接口说：" + detail : "")}",
-                        permanent: true);
-
-                if (!resp.IsSuccessStatusCode)
-                    throw new ProviderException($"HTTP {(int)resp.StatusCode}{(detail.Length > 0 ? "：" + detail : "")}");
-
-                var json = await resp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
-                result.BytesIn += Encoding.UTF8.GetByteCount(json);
-
-                JsonDocument doc;
-                try
+                foreach (var (owner, item) in pairs)
                 {
-                    doc = JsonDocument.Parse(json);
-                }
-                catch (JsonException ex)
-                {
-                    throw new ProviderException($"返回不是合法 JSON：{ex.Message}", permanent: true);
+                    if (item.ValueKind != JsonValueKind.Object) continue;
+                    AbsorbItem(cfg, owner, item, result);
                 }
 
-                using (doc)
+                // 分页：page 模式按页码递增，用 total / 本页数量判断翻完；
+                // cursor 模式看响应里的游标字段，has_more 为 false 也结束
+                if (pageMode)
                 {
-                    var root = doc.RootElement;
+                    result.ItemsInWindow += pairs.Count;
+                    pages++;
+                    result.Pages = pages;
 
-                    // 有些接口 key 不对也返回 HTTP 200，真正的问题在 body 的 code/msg：
-                    // 不抱出来就会被当成「空数据」静默呌掉（这个思路抄自 DeepSeek-Balance-Whale-Widget）
-                    var bizError = ApiBusinessError(root);
-                    if (!string.IsNullOrEmpty(bizError))
-                        throw new ProviderException($"接口返回 200 但业务层报错：{bizError}");
+                    var wantMore = pairs.Count > 0;
 
-                    var (resolved, pairs) = EnumerateItems(root, cfg.ItemsPath);
-                    if (!resolved)
-                        throw new ProviderException($"在返回里找不到条目数组「{cfg.ItemsPath}」——请改 ItemsPath", permanent: true);
-
-                    foreach (var (owner, item) in pairs)
+                    if (!string.IsNullOrWhiteSpace(cfg.TotalField)
+                        && TryNavigate(root, cfg.TotalField, out var totalEl)
+                        && totalEl.ValueKind == JsonValueKind.Number)
                     {
-                        if (item.ValueKind != JsonValueKind.Object) continue;
-                        AbsorbItem(cfg, owner, item, result);
+                        wantMore = result.ItemsInWindow < (long)totalEl.GetDouble();
+                    }
+                    else if (cfg.PageSize > 0)
+                    {
+                        wantMore = pairs.Count >= cfg.PageSize;
                     }
 
-                    // 分页：page 模式按页码递增，用 total / 本页数量判断翻完；
-                    // cursor 模式看响应里的游标字段，has_more 为 false 也结束
-                    if (pageMode)
-                    {
-                        result.ItemsInWindow += pairs.Count;
-                        pages++;
-                        result.Pages = pages;
-
-                        var wantMore = pairs.Count > 0;
-
-                        if (!string.IsNullOrWhiteSpace(cfg.TotalField)
-                            && TryNavigate(root, cfg.TotalField, out var totalEl)
-                            && totalEl.ValueKind == JsonValueKind.Number)
-                        {
-                            wantMore = result.ItemsInWindow < (long)totalEl.GetDouble();
-                        }
-                        else if (cfg.PageSize > 0)
-                        {
-                            wantMore = pairs.Count >= cfg.PageSize;
-                        }
-
-                        if (!wantMore) break;
-                        if (pages >= cfg.MaxPagesPerWindow)
-                            throw new ProviderException($"分页超过上限 {cfg.MaxPagesPerWindow} 页仍未结束——请检查 TotalField/PageSize 是否配对");
-
-                        pageNo++;
-                        cursor = pageNo.ToString(CultureInfo.InvariantCulture);
-                        continue;
-                    }
-
-                    cursor = string.Empty;
-                    if (!string.IsNullOrWhiteSpace(cfg.PageTokenField)
-                        && TryNavigate(root, cfg.PageTokenField, out var tokenEl))
-                    {
-                        cursor = tokenEl.ValueKind switch
-                        {
-                            JsonValueKind.String => tokenEl.GetString() ?? string.Empty,
-                            JsonValueKind.Number => tokenEl.ToString(),
-                            _ => string.Empty,
-                        };
-                    }
-
-                    if (!string.IsNullOrWhiteSpace(cfg.HasMoreField)
-                        && TryNavigate(root, cfg.HasMoreField, out var hasMore))
-                    {
-                        if (hasMore.ValueKind == JsonValueKind.False) cursor = string.Empty;
-                    }
-
-                    result.Pages = ++pages;
-                    if (string.IsNullOrEmpty(cursor)) break;
+                    if (!wantMore) break;
                     if (pages >= cfg.MaxPagesPerWindow)
-                        throw new ProviderException($"分页超过上限 {cfg.MaxPagesPerWindow} 页仍未结束——请检查 PageTokenField/PageParam 是否配对");
+                        throw new ProviderException($"分页超过上限 {cfg.MaxPagesPerWindow} 页仍未结束——请检查 TotalField/PageSize 是否配对");
+
+                    pageNo++;
+                    cursor = pageNo.ToString(CultureInfo.InvariantCulture);
+                    continue;
                 }
+
+                cursor = string.Empty;
+                if (!string.IsNullOrWhiteSpace(cfg.PageTokenField)
+                    && TryNavigate(root, cfg.PageTokenField, out var tokenEl))
+                {
+                    cursor = tokenEl.ValueKind switch
+                    {
+                        JsonValueKind.String => tokenEl.GetString() ?? string.Empty,
+                        JsonValueKind.Number => tokenEl.ToString(),
+                        _ => string.Empty,
+                    };
+                }
+
+                if (!string.IsNullOrWhiteSpace(cfg.HasMoreField)
+                    && TryNavigate(root, cfg.HasMoreField, out var hasMore))
+                {
+                    if (hasMore.ValueKind == JsonValueKind.False) cursor = string.Empty;
+                }
+
+                result.Pages = ++pages;
+                if (string.IsNullOrEmpty(cursor)) break;
+                if (pages >= cfg.MaxPagesPerWindow)
+                    throw new ProviderException($"分页超过上限 {cfg.MaxPagesPerWindow} 页仍未结束——请检查 PageTokenField/PageParam 是否配对");
             }
         }
 
         return result;
     }
+
+    /// <summary>
+    /// 读一个「某一刻的总额」：账户余额、剩余额度、已用总额。
+    ///
+    /// 与 FetchAsync 的三点区别，都是被接口现实逼出来的：
+    ///   1. 只要一个标量，不认 ItemsPath，也不产生按天账本；
+    ///   2. 不翻页 —— 一个数没有第二页；
+    ///   3. **不拼时间参数**。余额是快照，多带一个 start_date 常常直接被网关拒掉。
+    /// 发请求与错误处理共用 SendJsonAsync，不复制第二份。
+    /// </summary>
+    public async Task<ProviderBalanceResult> FetchBalanceAsync(ProviderConfig cfg, CancellationToken ct)
+    {
+        var key = ResolveKey(cfg);
+
+        var url = ResolveUrl(cfg, BuildBalanceUrl(cfg), key);
+        var (doc, bytes) = await SendJsonAsync(cfg, url, key, ct).ConfigureAwait(false);
+
+        using (doc)
+        {
+            var (found, raw) = ReadScalar(doc.RootElement, cfg.BalanceField);
+            if (!found)
+                throw new ProviderException(
+                    $"在返回里取不到数值「{cfg.BalanceField}」——请改 BalanceField"
+                    + "（支持 a.b、数组下标 a[0].b、钻进「字符串里包的 JSON」，逗号分隔多个会求和）",
+                    permanent: true);
+
+            var divisor = cfg.CostUnitDivisor > 0 && !double.IsNaN(cfg.CostUnitDivisor) && !double.IsInfinity(cfg.CostUnitDivisor)
+                ? cfg.CostUnitDivisor : 1;
+            var scale = cfg.CostScale > 0 && !double.IsNaN(cfg.CostScale) && !double.IsInfinity(cfg.CostScale)
+                ? cfg.CostScale : 1;
+
+            // decimal 装不下 1e30 这种数，硬转会在业务代码里抛 OverflowException，
+            // 用户看到的是一句天书；接口给的东西不像金额就该直接这么说
+            var converted = raw / divisor * scale;
+            if (!double.IsFinite(converted) || Math.Abs(converted) > 1e15)
+                throw new ProviderException(
+                    $"「{cfg.BalanceField}」取到 {raw.ToString(CultureInfo.InvariantCulture)}，换算后 {converted.ToString(CultureInfo.InvariantCulture)} —— 这不像个金额，"
+                    + "请检查 BalanceField 取对字段没有、CostUnitDivisor/CostScale 填对没有",
+                    permanent: true);
+
+            return new ProviderBalanceResult
+            {
+                Amount = (decimal)converted,
+                RawValue = raw,
+                Bytes = bytes,
+            };
+        }
+    }
+
+    /// <summary>校验配置并取出密钥。密钥只从环境变量来，取到的值只在这段内存里待着：
+    /// 不写缓存、不写日志、也绝不进任何异常文案（有断言盯着这条）。</summary>
+    private static string ResolveKey(ProviderConfig cfg)
+    {
+        if (!cfg.IsUsable(out var why)) throw new ProviderException(why, permanent: true);
+        var key = Environment.GetEnvironmentVariable(cfg.ApiKeyEnvVar.Trim()) ?? string.Empty;
+        if (string.IsNullOrWhiteSpace(key))
+            throw new ProviderException($"环境变量 {cfg.ApiKeyEnvVar.Trim()} 没有值", permanent: true);
+        return key;
+    }
+
+    /// <summary>余额/汇总型接口不认时间窗口，所以这里只拼 ExtraQuery。</summary>
+    private static string BuildBalanceUrl(ProviderConfig cfg)
+    {
+        var q = new StringBuilder();
+        if (!string.IsNullOrWhiteSpace(cfg.ExtraQuery))
+        {
+            foreach (var pair in cfg.ExtraQuery.Split('&', StringSplitOptions.RemoveEmptyEntries))
+            {
+                var kv = pair.Split('=', 2);
+                if (kv.Length == 2) AppendRaw(q, kv[0].Trim(), kv[1].Trim());
+            }
+        }
+
+        var joiner = (cfg.Path ?? string.Empty).Contains('?') ? "&" : "?";
+        return cfg.BaseUrl.TrimEnd('/') + cfg.Path + (q.Length > 0 ? joiner + q : string.Empty);
+    }
+
+    /// <summary>
+    /// 取一个标量金额。三种现实形态都要覆盖：
+    ///   · 值是数字，也可能是 "3.5" 这种字符串（DeepSeek 的 total_balance 就是字符串）；
+    ///   · 值可能藏在「字符串里包的 JSON」中，靠 TryNavigateDeep 钻进去；
+    ///   · 分钱包/多档余额要写成逗号分隔的多个路径求和。
+    /// <c>Found=false</c> 与「取到 0」是两回事：后者是真实余额，前者是字段名猜错了。
+    /// </summary>
+    internal static (bool Found, double Sum) ReadScalar(JsonElement root, string paths)
+    {
+        if (string.IsNullOrWhiteSpace(paths)) return (false, 0);
+
+        var any = false;
+        double sum = 0;
+        foreach (var raw in paths.Split(',', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var docs = new List<JsonDocument>();
+            try
+            {
+                if (!TryNavigateDeep(root, raw.Trim(), out var el, docs)) continue;
+                var v = el.ValueKind switch
+                {
+                    JsonValueKind.Number => el.GetDouble(),
+                    JsonValueKind.String => double.TryParse(el.GetString(), NumberStyles.Float, CultureInfo.InvariantCulture, out var p)
+                        ? p : (double?)null,
+                    _ => null,
+                };
+                if (v is null) continue;
+                any = true;
+                sum += v.Value;
+            }
+            finally
+            {
+                foreach (var d in docs) d.Dispose();
+            }
+        }
+
+        return (any, sum);
+    }
+
+    /// <summary>
+    /// 发一次 GET 并把响应体读成 JsonDocument。**所有接口形态共用这一段**：
+    /// 按天分页的用量与只要一个标量的余额都必须走这里，写成两份以后只会修其中一份。
+    ///
+    /// 负责的事情按顺序是：地址安全卡控 → 鉴权头 → 额外固定头 → 发送 →
+    /// 超时/连不上 → 4xx 提炼业务错误 → 读 body → 解析 JSON → 200 里的业务层错误。
+    /// 返回的 Doc 由调用方释放。
+    /// </summary>
+    private async Task<(JsonDocument Doc, long Bytes)> SendJsonAsync(
+        ProviderConfig cfg, string url, string key, CancellationToken ct)
+    {
+        AssertSafeUrl(url);
+
+        using var req = new HttpRequestMessage(HttpMethod.Get, url);
+
+        // 只加一个鉴权头；头名和前缀都可配，不假设任何厂商写法
+        var headerValue = string.IsNullOrEmpty(cfg.AuthPrefix) ? key : cfg.AuthPrefix + key;
+        if (!TryAddHeader(req, cfg.AuthHeader, headerValue, out var headerError))
+            throw new ProviderException(headerError, permanent: true);
+
+        // 部分接口除了鉴权头还强制要求版本头（例如 anthropic-version）
+        foreach (var (hk, hv) in ParseExtraHeaders(cfg.ExtraHeaders))
+            req.Headers.TryAddWithoutValidation(hk, hv);
+
+        HttpResponseMessage resp;
+        try
+        {
+            resp = await _http.SendAsync(req, HttpCompletionOption.ResponseContentRead, ct).ConfigureAwait(false);
+        }
+        catch (TaskCanceledException) when (!ct.IsCancellationRequested)
+        {
+            throw new ProviderException($"请求超时（{cfg.TimeoutSeconds}s）");
+        }
+        catch (HttpRequestException ex)
+        {
+            throw new ProviderException($"连不上接口：{ex.Message}");
+        }
+
+        using (resp)
+        {
+            // 非 2xx 也先读一次 body：401/403/404 的响应体里常常正好写着那句能定位问题的话
+            var detail = resp.IsSuccessStatusCode
+                ? string.Empty
+                : await ErrorDetailAsync(resp, ct).ConfigureAwait(false);
+
+            if (resp.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
+                throw new ProviderException($"权限不足或密钥无效（HTTP {(int)resp.StatusCode}）{(detail.Length > 0 ? "，接口说：" + detail : "")}——"
+                    + "注意：受限 Key 常常只能看到自己创建的 Key 的用量，这类接口不会报错，只会少给数",
+                    permanent: true);
+
+            if (resp.StatusCode == HttpStatusCode.NotFound)
+                throw new ProviderException($"接口路径不存在（HTTP 404）：{cfg.Path}{(detail.Length > 0 ? "，接口说：" + detail : "")}",
+                    permanent: true);
+
+            if (!resp.IsSuccessStatusCode)
+                throw new ProviderException($"HTTP {(int)resp.StatusCode}{(detail.Length > 0 ? "：" + detail : "")}");
+
+            var json = await resp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+            var bytes = Encoding.UTF8.GetByteCount(json);
+
+            JsonDocument doc;
+            try
+            {
+                doc = JsonDocument.Parse(json);
+            }
+            catch (JsonException ex)
+            {
+                throw new ProviderException($"返回不是合法 JSON：{ex.Message}", permanent: true);
+            }
+
+            // 有些接口 key 不对也返回 HTTP 200，真正的问题在 body 的 code/msg：
+            // 不抱出来就会被当成「空数据」静默吃掉（这个思路抄自 DeepSeek-Balance-Whale-Widget）
+            var bizError = ApiBusinessError(doc.RootElement);
+            if (!string.IsNullOrEmpty(bizError))
+            {
+                doc.Dispose();
+                throw new ProviderException($"接口返回 200 但业务层报错：{bizError}");
+            }
+
+            return (doc, bytes);
+        }
+    }
+
+    /// <summary>把 URL 模板里的 {base} / {key} 换成真值。
+    /// 少数接口把密钥放在查询参数里（例如 Gemini 的 ?key=…）才用得到 {key}；
+    /// 替换一定发生在安全校验之前，保证校验的是真正要发出去的那个地址。</summary>
+    internal static string ResolveUrl(ProviderConfig cfg, string url, string key)
+        => url.Replace("{base}", cfg.BaseUrl, StringComparison.Ordinal)
+              .Replace("{key}", Uri.EscapeDataString(key), StringComparison.Ordinal);
 
     private static bool TryAddHeader(HttpRequestMessage req, string name, string value, out string error)
     {
@@ -385,8 +534,12 @@ public sealed class ProviderClient : IDisposable
         {
             var divisor = cfg.CostUnitDivisor > 0 && !double.IsNaN(cfg.CostUnitDivisor) && !double.IsInfinity(cfg.CostUnitDivisor)
                 ? cfg.CostUnitDivisor : 1;
+            var scale = cfg.CostScale > 0 && !double.IsNaN(cfg.CostScale) && !double.IsInfinity(cfg.CostScale)
+                ? cfg.CostScale : 1;
+            // 换算全程留在 double 里，最后才进 1e-8 定点：
+            // 借 ReadNumber 的 scale 参数会先把「分」取整，小数金额直接被抹平
             var rawCost = ReadNumber(item, cfg.CostField, 1);
-            if (rawCost > 0) c.AddCost(rawCost / divisor);
+            if (rawCost > 0) c.AddCost(rawCost / divisor * scale);
         }
 
         result.ServerCost += c.Cost;

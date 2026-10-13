@@ -30,6 +30,12 @@ public sealed class TokenMeterPlugin : IslandPluginBase
     /// 账本要和水位线一起恢复，只恢复水位线等于把已拉区间连同数据一起弄丢。</summary>
     private readonly Dictionary<string, UsageLedger> _serverLedgers = new(StringComparer.Ordinal);
     private readonly Dictionary<string, DateTime?> _coveredUntil = new(StringComparer.Ordinal);
+
+    /// <summary>余额/汇总型接口的最近读数，键 = ProviderConfig.Id。
+    /// 单独一份而不是塞进 <see cref="_serverLedgers"/>：余额不是某一天的用量，
+    /// 进了账本就会在柱状图上长出一根假巨柱，并且每天被重复计入。</summary>
+    private readonly Dictionary<string, (decimal Amount, DateTime AtUtc)> _balances = new(StringComparer.Ordinal);
+
     private MultiProviderState _states = new();
     private string _cacheDir = string.Empty;
 
@@ -213,6 +219,7 @@ public sealed class TokenMeterPlugin : IslandPluginBase
                         // 用户把所有接口都关了：不能拿旧的服务端数据去压制本地日志
                         _serverLedgers.Clear();
                         _coveredUntil.Clear();
+                        _balances.Clear();
                     }
 
                     // 先把本地结果立即上屏：接口慢、卡住或在翻页时，界面也不会空着等你。
@@ -320,19 +327,25 @@ public sealed class TokenMeterPlugin : IslandPluginBase
     /// </summary>
     private Snapshot ComposeSnapshot(UsageLedger local, PricingConfig pricing, IReadOnlyList<ProviderConfig> providers, string note)
     {
-        var blocks = new List<SourceBlock>();
         var splitNote = string.Empty;
         var splitWarning = string.Empty;
         var undercount = false;
         var undercountDetail = string.Empty;
 
+        // 各来源的块先按接口 id 收着，最后再按配置文件里的书写顺序排（见 SnapshotBuilder.OrderBlocks）
+        var byId = new Dictionary<string, SourceBlock>(StringComparer.Ordinal);
+        SourceBlock localBlock;
+
         // 只有「启用了且真的拿到数据」的接口才参与认领：空账本参与的话，
-        // 一个还没拉通的接口会把模型从本地剔走，让数字凭空消失
+        // 一个还没拉通的接口会把模型从本地剔走，让数字凭空消失。
+        // 余额型接口不在这里：它不认领模型、不产生账本，走下面单独的一行。
         var live = providers
-            .Where(p => p.Enabled && _serverLedgers.ContainsKey(p.Id) && _serverLedgers[p.Id].Days.Count > 0)
+            .Where(p => p.Enabled && !p.IsBalance && _serverLedgers.ContainsKey(p.Id) && _serverLedgers[p.Id].Days.Count > 0)
+            .ToList();
+        var balances = providers
+            .Where(p => p.Enabled && p.IsBalance && _balances.ContainsKey(p.Id))
             .ToList();
 
-        SourceBlock primary;
         if (live.Count > 0)
         {
             var tuples = new List<(string, string, UsageLedger, ModelScope, DateTime?, int)>(live.Count);
@@ -343,8 +356,7 @@ public sealed class TokenMeterPlugin : IslandPluginBase
             var (localPart, assigned, split) = LedgerSplitter.SplitMany(local, tuples,
                 ModelScope.Parse(Settings.Get("localScope", string.Empty)));
 
-            var lb = SnapshotBuilder.BuildBlock(localPart, pricing, "本地日志");
-            blocks.Add(lb);
+            localBlock = SnapshotBuilder.BuildBlock(localPart, pricing, "本地日志");
 
             for (var i = 0; i < live.Count; i++)
             {
@@ -353,7 +365,7 @@ public sealed class TokenMeterPlugin : IslandPluginBase
                 serverPricing.Currency = string.IsNullOrWhiteSpace(live[i].Currency) ? "$" : live[i].Currency.Trim();
 
                 var sb = SnapshotBuilder.BuildBlock(assigned[i].Ledger, serverPricing, live[i].DisplayName);
-                blocks.Add(sb);
+                byId[live[i].Id] = sb;
                 MaybeLogReconcileSample(sb, live[i]);
             }
 
@@ -368,14 +380,39 @@ public sealed class TokenMeterPlugin : IslandPluginBase
                 note = string.IsNullOrEmpty(note) ? split.ConflictNote : note + "；" + split.ConflictNote;
             if (split.Undercount)
                 note = string.IsNullOrEmpty(note) ? split.UndercountDetail : note + "；" + split.UndercountDetail;
-
-            primary = lb.HasData ? lb : blocks[1];
         }
         else
         {
-            primary = SnapshotBuilder.BuildBlock(local, pricing, "本地日志");
-            blocks.Add(primary);
+            localBlock = SnapshotBuilder.BuildBlock(local, pricing, "本地日志");
         }
+
+        foreach (var p in balances)
+        {
+            var (amount, atUtc) = _balances[p.Id];
+            byId[p.Id] = new SourceBlock
+            {
+                Name = p.DisplayName,
+                Currency = string.IsNullOrWhiteSpace(p.Currency) ? "$" : p.Currency.Trim(),
+                HasData = true,
+                SummaryValue = amount,
+                SummaryAtUtc = atUtc,
+            };
+        }
+
+        // 显示顺序 = providers.json 里的书写顺序（本地块恒为第一位）：
+        // 岛面只够几行，谁被折掉就是这条顺序决定的，写在前面就排前面
+        var blocks = SnapshotBuilder.OrderBlocks(
+            providers.Select(p => p.Id).ToList(), localBlock, byId);
+
+        // Blocks[0] 恒为本地块，主块从这里挑。余额块不当选：它没有「今日/本周」的概念，
+        // 让它当主块会让岛面标题显示成一个余额数字。
+        var primary = blocks[0].HasData
+            ? blocks[0]
+            : blocks.FirstOrDefault(b => !b.IsSummary && b.HasData) ?? blocks[0];
+
+        var modeParts = new List<string> { "本地日志" };
+        if (live.Count > 0) modeParts.Add(live.Count == 1 ? "云端用量（分列）" : $"{live.Count} 个云端用量（分列）");
+        if (balances.Count > 0) modeParts.Add($"{balances.Count} 个余额读值");
 
         var snap = new Snapshot
         {
@@ -385,11 +422,9 @@ public sealed class TokenMeterPlugin : IslandPluginBase
             ScannedBytes = local.ScannedBytes,
             Blocks = blocks,
             SplitNote = splitNote,
-            SourceMode = live.Count > 0
-                ? (live.Count == 1 ? "本地 + 云端（分列）" : $"本地 + {live.Count} 个云端（分列）")
-                : "本地日志",
-            ProviderSummary = live.Count > 0
-                ? string.Join(" ｜ ", live.Select(p => p.SafeSummary()))
+            SourceMode = string.Join(" ＋ ", modeParts),
+            ProviderSummary = live.Count + balances.Count > 0
+                ? string.Join(" ｜ ", live.Concat(balances).Select(p => p.SafeSummary()))
                 : (providers.Any(p => p.Enabled) ? "已启用的接口本轮没有可用数据" : "服务端接口未启用"),
             CoveredUntilUtc = CoveredFloor(live),
             ProviderNote = note,
@@ -408,9 +443,17 @@ public sealed class TokenMeterPlugin : IslandPluginBase
     /// <summary>
     /// 从水位线滚到「现在 - 滞后带」：跨度超过 WindowMaxDays 就切段，
     /// 每段内部把分页翻完；一轮最多 MaxWindowsPerRun 段，避免首次同步把界面卡死。
+    ///
+    /// 余额型接口走另一条路：它没有「补历史」的概念，一次请求就一个数。
     /// </summary>
     private async Task PullProviderAsync(ProviderConfig cfg, CancellationToken ct)
     {
+        if (cfg.IsBalance)
+        {
+            await PullBalanceAsync(cfg, ct).ConfigureAwait(false);
+            return;
+        }
+
         var nowUtc = DateTime.UtcNow;
         var st = _states.For(cfg.Id);
         var plan = ProviderClient.PlanWindows(_coveredUntil.GetValueOrDefault(cfg.Id), nowUtc, cfg);
@@ -455,6 +498,34 @@ public sealed class TokenMeterPlugin : IslandPluginBase
         Log.Info($"服务端用量拉取完成：{windows} 段 / {pages} 页 / {Format.Bytes(bytes)}"
                + (hitBudget ? $"（本轮接口预算 {cfg.ProviderBudgetSeconds}s 用完，剩余窗口下轮继续）" : string.Empty)
                + $"，水位线推到 {advanced:yyyy-MM-dd HH:mm}Z，累计 {Format.Tokens(st.ServerTotalTokens)} token");
+    }
+
+    /// <summary>
+    /// 读一次余额/汇总型接口。只存「最近一个读数 + 时刻」，不进按天账本、不进近 7 天图。
+    /// 失败时保留上一次读数：上一刻的余额仍然是比「没有余额」更好的信息，
+    /// 但界面会带上它是几点看的，不会让人误当成实时值。
+    /// </summary>
+    private async Task PullBalanceAsync(ProviderConfig cfg, CancellationToken ct)
+    {
+        var nowUtc = DateTime.UtcNow;
+        var st = _states.For(cfg.Id);
+
+        using var client = new ProviderClient(cfg.TimeoutSeconds);
+        var r = await client.FetchBalanceAsync(cfg, ct).ConfigureAwait(false);
+
+        _balances[cfg.Id] = (r.Amount, nowUtc);
+        st.LatestBalance = (double)r.Amount;
+        st.BalanceAtUtc = nowUtc;
+        st.LastSuccessUtc = nowUtc;
+        st.LastAttemptUtc = nowUtc;
+        st.LastError = null;
+        SaveStates();
+
+        var cur = string.IsNullOrWhiteSpace(cfg.Currency) ? "$" : cfg.Currency.Trim();
+        Log.Info($"接口余额读取完成：{Format.Money(cur, r.Amount)}"
+               + $"（接口原值 {r.RawValue.ToString(CultureInfo.InvariantCulture)}，"
+               + $"÷{cfg.CostUnitDivisor.ToString(CultureInfo.InvariantCulture)} ×{cfg.CostScale.ToString(CultureInfo.InvariantCulture)}）"
+               + $"，{Format.Bytes(r.Bytes)}");
     }
 
     private readonly Dictionary<string, DateTime> _lastReconcileLogUtc = new(StringComparer.Ordinal);
@@ -537,7 +608,10 @@ public sealed class TokenMeterPlugin : IslandPluginBase
                 if (legacy.CoveredUntilUtc is not null || legacy.HasPersistedLedger)
                 {
                     var fresh = new MultiProviderState();
-                    fresh.AdoptLegacy(providers[0].Id, legacy);
+                    // v1 装的是「按天账本 + 水位线」，只能挂到用量型接口名下：
+                    // 挂给余额型接口的话这笔历史永远不会被任何代码读到
+                    var target = providers.FirstOrDefault(p => !p.IsBalance) ?? providers[0];
+                    fresh.AdoptLegacy(target.Id, legacy);
                     Log.Info("已把单接口时代的同步状态迁移到当前接口名下");
                     return fresh;
                 }
@@ -555,12 +629,18 @@ public sealed class TokenMeterPlugin : IslandPluginBase
         _states = LoadStates(providers);
         _serverLedgers.Clear();
         _coveredUntil.Clear();
+        _balances.Clear();
 
         foreach (var p in providers)
         {
             var st = _states.For(p.Id);
             _coveredUntil[p.Id] = st.CoveredUntilUtc;
             if (st.HasPersistedLedger) _serverLedgers[p.Id] = st.LoadLedger();
+
+            // 缓存文件是外部输入：写坏过一次的数字（NaN、1e30）不能把 double→decimal 炸成异常，
+            // 那会让整个恢复流程挂掉、界面上一次读数全丢
+            if (st.LatestBalance is {} bal && st.BalanceAtUtc is not null && bal >= -1e15 && bal <= 1e15)
+                _balances[p.Id] = ((decimal)bal, st.BalanceAtUtc.Value);
         }
     }
 
@@ -865,7 +945,7 @@ public sealed class TokenMeterPlugin : IslandPluginBase
             provStatusText.Text = list.Count == 0
                 ? "当前没有加载到任何接口。"
                 : "已加载 " + list.Count + " 个接口："
-                  + string.Join("；", list.Select(p => $"{LabelOf(p)}（{(p.Enabled ? "启用" : "未启用")}｜{p.BaseUrl}{p.Path}）"));
+                  + string.Join("；", list.Select(p => $"{LabelOf(p)}（{(p.Enabled ? "启用" : "未启用")}｜{(p.IsBalance ? "余额" : "用量")}｜{p.BaseUrl}{p.Path}）"));
         }
 
         RenderProviderStatus();
@@ -1014,6 +1094,7 @@ public sealed class TokenMeterPlugin : IslandPluginBase
             // 而“完整”两个字就是假的
             _serverLedgers.Clear();
             _coveredUntil.Clear();
+            _balances.Clear();
             _states = new MultiProviderState();
             SaveStates();
             Status("已清空缓存（含云端水位线），正在从头重扫…（第一次会慢）");

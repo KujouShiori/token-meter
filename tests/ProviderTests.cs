@@ -37,6 +37,8 @@ public static class ProviderTests
             await CaseAnthropicShapeAsync(prefix);
             await CaseNewCapabilitiesAsync(prefix);
             await CaseNewApiShapeAsync(prefix);
+            await CaseBalanceAsync(prefix);
+            CaseMovedRequestPath(prefix);
             CaseSplitter();
             CaseServerLedgerPersistence();
             CasePlanWindows();
@@ -404,6 +406,154 @@ public static class ProviderTests
     }
 
     /// <summary>
+    /// 余额/汇总型接口的真实取数。重点验证三件只有跑起来才知道的事：
+    /// 它复用了同一套鉴权与错误处理、它**不带**时间/分页参数、
+    /// 以及「余额是 0」和「字段名猜错了」这两种情况必须表现不同。
+    /// </summary>
+    private static async Task CaseBalanceAsync(string prefix)
+    {
+        const string secret = "BALSECRET-do-not-leak";
+        Environment.SetEnvironmentVariable("WL_FAKE_KEY", secret);
+        var baseUrl = prefix.TrimEnd('/');
+        lock (Seen) { Seen.Clear(); }
+        lock (SeenHeaders) { SeenHeaders.Clear(); }
+
+        ProviderConfig Bal(string path, string field, double divisor = 1, double scale = 1) => new()
+        {
+            Enabled = true,
+            BaseUrl = baseUrl,
+            Path = path,
+            AuthHeader = "Authorization",
+            AuthPrefix = "",
+            ApiKeyEnvVar = "WL_FAKE_KEY",
+            Kind = "balance",
+            BalanceField = field,
+            CostUnitDivisor = divisor,
+            CostScale = scale,
+            TimeoutSeconds = 10,
+            // 下面这些是用量型接口才用的参数，故意填上：如果它们漏进了余额请求，
+            // 「不带时间参数」那条断言会立刻红
+            StartParam = "start_timestamp",
+            EndParam = "end_timestamp",
+            TimeFormat = "unix",
+            PageParam = "page",
+            PageSizeParam = "per_page",
+            PageSize = 50,
+        };
+
+        using var client = new ProviderClient(10);
+
+        var r = await client.FetchBalanceAsync(Bal("/balance", "balance_infos[0].total_balance"), CancellationToken.None);
+        Check("取到字符串形态的余额（249.90）", Math.Abs((double)r.Amount - 249.90) < 1e-9, $"Amount={r.Amount}");
+        Check("接口原值也带回来（核对换算率用）", Math.Abs(r.RawValue - 249.90) < 1e-9, $"Raw={r.RawValue}");
+        Check("余额响应体计了字节数", r.Bytes > 0, $"Bytes={r.Bytes}");
+        Check("带了鉴权头", SeenHeaders.Any(h => h.Contains($"authorization={secret}")), "missing");
+        Check("余额请求只发一次（一个标量没有第二页）", Seen.Count == 1, $"发了 {Seen.Count} 次：{string.Join(" | ", Seen)}");
+        Check("余额请求不拼时间参数",
+            !Seen.Any(q => q.Contains("start_timestamp") || q.Contains("end_timestamp") || q.Contains("start_date")),
+            string.Join(" | ", Seen));
+        Check("余额请求不拼分页参数",
+            !Seen.Any(q => q.Contains("page=") || q.Contains("per_page=")), string.Join(" | ", Seen));
+
+        var both = await client.FetchBalanceAsync(
+            Bal("/balance", "balance_infos[0].total_balance,balance_infos[1].total_balance"), CancellationToken.None);
+        Check("逗号分隔多路径求和（两个钱包 249.90+0.10）", Math.Abs((double)both.Amount - 250.0) < 1e-6, $"Amount={both.Amount}");
+
+        var quota = await client.FetchBalanceAsync(Bal("/balancequota", "data.quota", divisor: 500000), CancellationToken.None);
+        Check("整数记账按换算率折成金额（49572 ÷ 500000）", Math.Abs((double)quota.Amount - 0.099144) < 1e-9, $"Amount={quota.Amount}");
+
+        var cents = await client.FetchBalanceAsync(Bal("/balancequota", "data.quota", scale: 0.01), CancellationToken.None);
+        Check("CostScale 参与换算且没被取整抹平（49572 × 0.01 = 495.72）",
+            Math.Abs((double)cents.Amount - 495.72) < 1e-9, $"Amount={cents.Amount}");
+
+        var deep = await client.FetchBalanceAsync(Bal("/balancestr", "data.other.left"), CancellationToken.None);
+        Check("钻进「字符串里包的 JSON」取余额（12.5）", Math.Abs((double)deep.Amount - 12.5) < 1e-9, $"Amount={deep.Amount}");
+
+        var zero = await client.FetchBalanceAsync(Bal("/balancezero", "data.total_balance"), CancellationToken.None);
+        Check("余额真的是 0 时是有效读数，不报错", zero.Amount == 0m, $"Amount={zero.Amount}");
+
+        try
+        {
+            await client.FetchBalanceAsync(Bal("/balancemissing", "data.total_balance"), CancellationToken.None);
+            Check("字段名猜错要报错，不能当余额 0 显示", false, "没抛");
+        }
+        catch (ProviderException ex)
+        {
+            Check("字段名猜错时报错并指向 BalanceField",
+                ex.Permanent && ex.Message.Contains("BalanceField"), ex.Message);
+            Check("取数失败的文案不泄漏密钥值", !ex.Message.Contains(secret), "密钥出现在异常里");
+        }
+
+        try
+        {
+            await client.FetchBalanceAsync(Bal("/balancehuge", "data.total_balance"), CancellationToken.None);
+            Check("换算完不像金额的数字要报错", false, "没抛");
+        }
+        catch (ProviderException ex)
+        {
+            Check("换算完不像金额时直说，而不是甩一个 OverflowException 给用户",
+                ex.Permanent && ex.Message.Contains("不像个金额") && ex.Message.Contains("CostUnitDivisor"), ex.Message);
+        }
+
+        try
+        {
+            await client.FetchBalanceAsync(Bal("/denied", "data.total_balance"), CancellationToken.None);
+            Check("余额接口 401 要抛 ProviderException", false, "没抛");
+        }
+        catch (ProviderException ex)
+        {
+            Check("余额接口复用同一套 401 处理（含接口原话）",
+                ex.Permanent && ex.Message.Contains("权限不足") && ex.Message.Contains("insufficient scope"), ex.Message);
+            Check("余额接口的 401 文案不泄漏密钥值", !ex.Message.Contains(secret), "密钥出现在异常里");
+        }
+    }
+
+    /// <summary>
+    /// 抽 SendJsonAsync 时必须一起锁住的两条分支：404 与「200 但不是 JSON」。
+    /// 这两条以前没有用例覆盖，重构后万一顺序写反了没人报警。
+    /// </summary>
+    private static void CaseMovedRequestPath(string prefix)
+    {
+        const string secret = "SECRET-DO-NOT-LEAK";
+        Environment.SetEnvironmentVariable("WL_FAKE_KEY", secret);
+
+        var cfg404 = BaseCfg(prefix);
+        cfg404.Path = "/notfound";
+        using (var client = new ProviderClient(cfg404.TimeoutSeconds))
+        {
+            try
+            {
+                client.FetchAsync(cfg404, DateTime.UtcNow.AddDays(-1), DateTime.UtcNow, CancellationToken.None)
+                      .GetAwaiter().GetResult();
+                Check("404 要抛 ProviderException", false, "没抛");
+            }
+            catch (ProviderException ex)
+            {
+                Check("404 提示路径不存在并带出接口原话",
+                    ex.Permanent && ex.Message.Contains("404") && ex.Message.Contains("接口说：no such path"), ex.Message);
+                Check("404 文案不泄漏密钥值", !ex.Message.Contains(secret), "密钥出现在异常里");
+            }
+        }
+
+        var cfgBad = BaseCfg(prefix);
+        cfgBad.Path = "/html";
+        using (var client = new ProviderClient(cfgBad.TimeoutSeconds))
+        {
+            try
+            {
+                client.FetchAsync(cfgBad, DateTime.UtcNow.AddDays(-1), DateTime.UtcNow, CancellationToken.None)
+                      .GetAwaiter().GetResult();
+                Check("非 JSON 响应要抛 ProviderException", false, "没抛");
+            }
+            catch (ProviderException ex)
+            {
+                Check("非 JSON 响应报「返回不是合法 JSON」并算永久失败",
+                    ex.Permanent && ex.Message.Contains("不是合法 JSON"), ex.Message);
+            }
+        }
+    }
+
+    /// <summary>
     /// 多来源分派用例：两个运营商的账不能互相覆盖（曾经的 bug：29 天本地账被压成 1 天），
     /// 重叠模型不能算两遍，币种不能混加。
     /// </summary>
@@ -521,6 +671,47 @@ public static class ProviderTests
             {
                 status = 401;
                 body = "{\"error\":{\"message\":\"insufficient scope\"}}";
+            }
+            else if (path == "/notfound")
+            {
+                status = 404;
+                body = "{\"error\":{\"message\":\"no such path\"}}";
+            }
+            else if (path == "/balance")
+            {
+                // DeepSeek 形态：分钱包、值是字符串（"249.90"）、藏在数组里
+                body = "{\"success\":true,\"is_pro_user\":false,\"balance_infos\":["
+                     + "{\"group\":\"general\",\"total_balance\":\"249.90\"},"
+                     + "{\"group\":\"timing\",\"total_balance\":\"0.10\"}]}";
+            }
+            else if (path == "/balancequota")
+            {
+                // New API 形态：整数记账，要 ÷ 500000 才是美元
+                body = "{\"code\":0,\"data\":{\"quota\":49572,\"used_quota\":100}}";
+            }
+            else if (path == "/balancestr")
+            {
+                // 值藏在「字符串里包的 JSON」里
+                body = "{\"data\":{\"other\":\"{\\\"left\\\":12.5}\"}}";
+            }
+            else if (path == "/balancezero")
+            {
+                // 真·余额为零：这必须是有效读数，不能和「字段名猜错了」混成一回事
+                body = "{\"data\":{\"total_balance\":0}}";
+            }
+            else if (path == "/balancemissing")
+            {
+                body = "{\"data\":{\"something\":1}}";
+            }
+            else if (path == "/balancehuge")
+            {
+                // 取错了字段时会拿到一个天文数字（例如把 token 数当成了余额）
+                body = "{\"data\":{\"total_balance\":1e30}}";
+            }
+            else if (path == "/html")
+            {
+                // 200 + 一段根本不是 JSON 的 HTML（网关登录页、CDN 报错页都是这个形态）
+                body = "<html><body>502 Bad Gateway</body></html>";
             }
             else if (path == "/badshape")
             {

@@ -404,6 +404,28 @@ public static class SnapshotBuilder
     }
 
     /// <summary>
+    /// 把各来源的块排成岛面/聚光卡的显示顺序：<b>本地块永远在第一位</b>（视图拿 Blocks[0] 当主块，
+    /// 从 i=1 起才画"其他来源"），其余按接口配置文件里的书写顺序。
+    ///
+    /// 为什么按书写顺序：岛面高度只够几行，来源一多就要折掉几个。原来固定"用量全排在余额前面"，
+    /// 于是 3 个用量 + 2 个余额时<b>余额一行都露不出来</b>，用户在文件里把余额写在第几个都说了不算。
+    /// 按文件顺序至少可预测：写在前面就排前面。
+    ///
+    /// 抽成纯函数是因为"哪几个来源会被折掉"是一条规则，规则该被断言锁住，而不是靠肉眼数行。
+    /// </summary>
+    public static List<SourceBlock> OrderBlocks(
+        IReadOnlyList<string> idsInFileOrder, SourceBlock local, IReadOnlyDictionary<string, SourceBlock> byId)
+    {
+        var blocks = new List<SourceBlock> { local };
+        foreach (var id in idsInFileOrder)
+        {
+            // 关掉的、或本轮没拿到数据的接口不在 byId 里，直接跳过
+            if (byId.TryGetValue(id, out var blk)) blocks.Add(blk);
+        }
+        return blocks;
+    }
+
+    /// <summary>
     /// 决定这个窗口的费用口径。只有服务端金额几乎覆盖该窗口全部 token 时，
     /// 才用服务端金额替掉本地估算；否则保留估算并标成混合，
     /// 避免把「部分天的服务端数据」当成全量费用报出去。

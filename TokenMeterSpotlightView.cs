@@ -14,8 +14,12 @@ namespace TokenMeter;
 ///   3. 配色跟着岛体明暗走，浅/深两套都要读得清。
 ///
 /// 多来源约定：本地日志与云端接口是**两个运营商、两种币种**，
-/// 所以 KPI 按来源各一栏、柱状图按来源画双柱（柱高用 token 数这个跨币种可比的量，
+/// 所以 KPI 按来源各一栏、柱状图每个来源一根柱（柱高用 token 数这个跨币种可比的量，
 /// 金额只进标签文字），明细表按来源分组。绝不把 ¥ 和 $ 加在同一个数上。
+///
+/// 来源数量是"用户想接几个就接几个"的，所以视图里没有任何一处写死 2：
+/// 柱宽按来源数反推、颜色四档循环加图例、明细表逐来源各自限长。
+/// 余额/汇总型来源（<see cref="SourceBlock.IsSummary"/>）不参与按天图与明细表，只在 KPI 单独一块。
 /// </summary>
 public sealed class TokenMeterSpotlightView : UserControl
 {
@@ -44,8 +48,13 @@ public sealed class TokenMeterSpotlightView : UserControl
     /// <summary>除首列（星型，模型名）外六列的基准宽：请求/输入/输出/缓存读/合计/费用。</summary>
     private static readonly double[] TableColWidths = { 36, 44, 50, 56, 56, 74 };
 
+    /// <summary>明细表**每个来源**最多列几个模型（不是全表合计），超出就折成一句提示。
+    /// 卡片是纵向可滚的，所以这里限制的是"一眼看得完"而不是空间。</summary>
+    private const int MaxTableRowsPerSource = 12;
+
     private readonly IIslandTheme _theme;
     private readonly StackPanel _kpiHost;
+    private readonly TextBlock _legend;
     private readonly Grid _bars;
     private readonly StackPanel _table;
     private readonly TextBlock _source;
@@ -58,10 +67,22 @@ public sealed class TokenMeterSpotlightView : UserControl
     private readonly SolidColorBrush _accentBrush = new();
     private readonly SolidColorBrush _barBrush = new();
     private readonly SolidColorBrush _bar2Brush = new();
+    private readonly SolidColorBrush _bar3Brush = new();
+    private readonly SolidColorBrush _bar4Brush = new();
     private readonly SolidColorBrush _barTrackBrush = new();
 
     private Snapshot? _last;
     public event Action? RefreshRequested;
+
+    /// <summary>来源 → 柱子/图例的颜色。超过四种就循环复用：接口数量没有上限，颜色不能没有上限
+    /// —— 循环之后靠图例上的名字对回去，而不是让某个来源画不出柱子。</summary>
+    private SolidColorBrush BarBrushFor(int i) => (i % 4) switch
+    {
+        0 => _barBrush,
+        1 => _bar2Brush,
+        2 => _bar3Brush,
+        _ => _bar4Brush,
+    };
 
     public TokenMeterSpotlightView(PluginManifest manifest, IIslandTheme theme)
     {
@@ -96,6 +117,15 @@ public sealed class TokenMeterSpotlightView : UserControl
         // 之前每格写死 93.8，7 格共 707.3，超过卡片可用的 688.8，
         // 而横向滚动是禁用的，于是最右那一格被挤裁。星型列永远适配卡片宽度。
         _bars = new Grid();
+        // 图例：柱子颜色按来源循环复用（接口数量没有上限），所以超过一种时必须有个
+        // 「色块 → 名字」的对应关系，否则第三根柱子开始就没人知道它是谁。
+        // 用一行会换行的文字而不是横排 StackPanel：横排的不会换行，名字一长就把卡片撑破。
+        _legend = new TextBlock
+        {
+            FontSize = T(11),
+            Foreground = _mutedBrush,
+            TextWrapping = TextWrapping.Wrap,
+        };
         _table = new StackPanel { Spacing = S(2) };
 
         var chartLabel = new TextBlock { Text = "近 7 天用量", FontSize = D(13), Foreground = _mutedBrush };
@@ -114,6 +144,7 @@ public sealed class TokenMeterSpotlightView : UserControl
         root.Children.Add(_kpiHost);
         root.Children.Add(Divider());
         root.Children.Add(chartLabel);
+        root.Children.Add(_legend);
         root.Children.Add(_bars);
         root.Children.Add(Divider());
         root.Children.Add(tableLabel);
@@ -180,6 +211,24 @@ public sealed class TokenMeterSpotlightView : UserControl
         {
             var wrap = new StackPanel { Spacing = S(3) };
 
+            if (b.IsSummary)
+            {
+                // 余额型来源单独一行：它只有「此刻还剩多少」，没有今日/本周/累计，
+                // 硬套五格 KPI 会画出五个「—」，看起来像数据坏了
+                wrap.Children.Add(new TextBlock
+                {
+                    Text = $"{b.Name} ｜ {b.Currency} ｜ 余额（某一刻的总额，不进按天统计与柱状图）",
+                    FontSize = T(11),
+                    Foreground = _faintBrush,
+                });
+                wrap.Children.Add(Kpi(
+                    Format.Money(b.Currency, b.SummaryValue!.Value),
+                    "当前余额",
+                    b.SummaryAtUtc is null ? null : $"{Format.Ago(b.SummaryAtUtc.Value)}读取"));
+                _kpiHost.Children.Add(wrap);
+                continue;
+            }
+
             wrap.Children.Add(new TextBlock
             {
                 Text = $"{b.Name} ｜ {b.Currency} ｜ {b.Today.CostBasis}",
@@ -241,17 +290,48 @@ public sealed class TokenMeterSpotlightView : UserControl
         return stack;
     }
 
-    // ---------------- 近 7 天：本地 + 云端双柱 ----------------
+    // ---------------- 近 7 天：每个来源一根柱子 ----------------
+
+    /// <summary>卡片里横向真正可用的宽度（左右内边距之外，还要给纵向滚动条留位）。
+    /// 横向滚动是禁用的，所以柱子总宽必须自己算进这个数里 —— 写死 30 的话第三个来源起就挤出卡片。</summary>
+    private const double ChartUsableWidth = CardWidth - 2 * (30 * LayoutScale) - 18 * LayoutScale;
 
     private void RebuildBars(Snapshot s)
     {
         _bars.Children.Clear();
         _bars.ColumnDefinitions.Clear();
-        var blocks = s.Blocks;
+        // 先清掉上一次的图例：下面有两个提前 return，不清就会留着上一帧的来源名
+        _legend.Inlines.Clear();
+        _legend.Visibility = Visibility.Collapsed;
+        // 余额型来源不进柱状图：它没有按天数据，画进去是每天一根一样的空柱 + 一列「—」，
+        // 会把真正的用量刻度挤扁
+        var blocks = s.Blocks.Where(b => !b.IsSummary).ToList();
         if (blocks.Count == 0) return;
 
-        var days = blocks[0].Last7.Count;
+        // 天数不能假定 blocks[0] 就是本地块：本地块没数据时它仍在列表里，但 Last7 的长度
+        // 由 SnapshotBuilder 统一给 7，取最大值只是防一手结构变化
+        var days = blocks.Max(b => b.Last7.Count);
         if (days == 0) return;
+
+        // 图例：颜色是按来源循环复用的，没有图例的话第三根柱子开始就没人知道它是谁
+        if (blocks.Count > 1)
+        {
+            _legend.Visibility = Visibility.Visible;
+            for (var b = 0; b < blocks.Count; b++)
+            {
+                if (b > 0) _legend.Inlines.Add(new Microsoft.UI.Xaml.Documents.Run { Text = "    " });
+                _legend.Inlines.Add(new Microsoft.UI.Xaml.Documents.Run
+                {
+                    Text = "■ ",
+                    Foreground = BarBrushFor(b),
+                });
+                _legend.Inlines.Add(new Microsoft.UI.Xaml.Documents.Run { Text = blocks[b].Name });
+            }
+        }
+        else
+        {
+            _legend.Visibility = Visibility.Collapsed;
+        }
 
         // 柱高必须用同一个量做刻度。¥ 和 $ 不能比大小，所以用 token 数（跨币种可比）。
         var maxTokens = 1L;
@@ -261,11 +341,19 @@ public sealed class TokenMeterSpotlightView : UserControl
                     maxTokens = blocks[b].Last7[i].Total;
 
         var corner = new CornerRadius(S(4));
-        var barWidth = D(30);
+
+        // 列是星型均分的，所以每天可用的横向空间 = 可用宽 / 天数；
+        // 一天里要放下 blocks.Count 根柱子加它们的间距，反推柱宽并夹在 5~30 之间。
+        // 来源越多柱子越细，而不是挤出卡片 —— 卡片宽度不能跟着接口数量长。
+        var barSpacing = S(4);
+        var perDay = ChartUsableWidth / days;
+        var barWidth = Math.Clamp(
+            (perDay - barSpacing * (blocks.Count - 1)) / blocks.Count,
+            S(6), D(30));
 
         for (var i = 0; i < days; i++)
         {
-            var day = blocks[0].Last7[i].Day;
+            var day = blocks.First(b => i < b.Last7.Count).Last7[i].Day;
 
             _bars.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
 
@@ -299,7 +387,8 @@ public sealed class TokenMeterSpotlightView : UserControl
                 {
                     Text = text,
                     FontSize = D(9.5),
-                    Foreground = b == 0 ? _mutedBrush : _faintBrush,
+                    // 用该来源柱子那个颜色：标签和柱子对得上，才不需要每个柱子再画一遍名字
+                    Foreground = BarBrushFor(b),
                     TextAlignment = TextAlignment.Center,
                     HorizontalAlignment = HorizontalAlignment.Center,
                     TextWrapping = TextWrapping.NoWrap,
@@ -325,7 +414,7 @@ public sealed class TokenMeterSpotlightView : UserControl
             var barRow = new StackPanel
             {
                 Orientation = Orientation.Horizontal,
-                Spacing = S(4),
+                Spacing = barSpacing,
                 HorizontalAlignment = HorizontalAlignment.Center,
             };
             for (var b = 0; b < blocks.Count; b++)
@@ -345,7 +434,7 @@ public sealed class TokenMeterSpotlightView : UserControl
                     {
                         Height = h,
                         Width = barWidth,
-                        Background = b == 0 ? _barBrush : _bar2Brush,
+                        Background = BarBrushFor(b),
                         CornerRadius = corner,
                         VerticalAlignment = VerticalAlignment.Bottom,
                     },
@@ -373,7 +462,8 @@ public sealed class TokenMeterSpotlightView : UserControl
     private void RebuildTable(Snapshot s)
     {
         _table.Children.Clear();
-        var blocks = s.Blocks;
+        // 明细表是「按模型的今日用量」，余额型来源没有这个概念，在上面那栏单独给了
+        var blocks = s.Blocks.Where(b => !b.IsSummary).ToList();
         var multi = blocks.Count > 1;
 
         if (blocks.Count == 0 || blocks.All(b => b.TodayByModel.Count == 0))
@@ -389,9 +479,13 @@ public sealed class TokenMeterSpotlightView : UserControl
 
         _table.Children.Add(TableRow("模型", "请求", "输入", "输出", "缓存读", "合计", "费用", header: true));
 
-        var shown = 0;
         foreach (var b in blocks)
         {
+            // 上限必须**逐来源**算。原来是个跨来源共享的计数器，于是第三个来源
+            // 一进来就已经超了上限，整块明细被静默丢掉，而那行提示用的又是这个来源自己的模型数
+            // 减去共享计数 —— 数字既不对、丢掉的明细也没人知道。
+            var shown = 0;
+
             // 归属标签：只写来源名与口径，币种与金额在上面那栏 KPI 里已经给了
             if (multi)
             {
@@ -412,7 +506,7 @@ public sealed class TokenMeterSpotlightView : UserControl
 
             foreach (var m in b.TodayByModel)
             {
-                if (shown >= 12)
+                if (shown >= MaxTableRowsPerSource)
                 {
                     _table.Children.Add(new TextBlock
                     {
@@ -484,6 +578,13 @@ public sealed class TokenMeterSpotlightView : UserControl
         _bar2Brush.Color = _theme.IsLight
             ? Windows.UI.Color.FromArgb(255, 176, 108, 0)
             : Windows.UI.Color.FromArgb(255, 245, 195, 107);
+        // 第三、第四档用青绿与紫：与蓝/琥珀在两套主题下都能一眼分开
+        _bar3Brush.Color = _theme.IsLight
+            ? Windows.UI.Color.FromArgb(255, 0, 138, 122)
+            : Windows.UI.Color.FromArgb(255, 102, 222, 204);
+        _bar4Brush.Color = _theme.IsLight
+            ? Windows.UI.Color.FromArgb(255, 130, 72, 190)
+            : Windows.UI.Color.FromArgb(255, 190, 152, 255);
     }
 
     private Windows.UI.Color Neutral(byte alpha) => _theme.IsLight
