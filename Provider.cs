@@ -454,7 +454,7 @@ public sealed class ProviderRegistry
             {
                 var one = JsonSerializer.Deserialize<ProviderConfig>(raw, JsonOpts);
                 if (one is null) return null;
-                var reg = new ProviderRegistry();
+                var reg = new ProviderRegistry { FromLegacyObject = true };
                 reg.Items.Add(one);
                 reg.EnsureIds();
                 return reg;
@@ -469,10 +469,22 @@ public sealed class ProviderRegistry
     }
 
     /// <summary>给缺 id 的条目补一个，并把重复 id 改掉——同 id 会让两份账本互相覆盖。</summary>
+    /// <summary>单接口时代那份配置迁移过来时固定用这个 id，保证跨启动稳定。</summary>
+    public const string LegacyId = "legacy-primary";
+
+    /// <summary>本次是不是从「单个对象」读出来的（也就是老配置）。</summary>
+    public bool FromLegacyObject { get; set; }
+
+    /// <summary>给缺 id 的条目补一个。必须**确定性**生成：随机 id 会让每次启动换一把钥匙，
+    /// 已经积累的云端账本就永远对不上键，等于每次重启丢一次云端历史。
+    /// 只有撞车的条目才退回随机串 —— 那时身份通常已经落盘，不再依赖可推导性。</summary>
     public void EnsureIds()
     {
-        foreach (var c in Items)
-            if (string.IsNullOrWhiteSpace(c.Id)) c.Id = NewId();
+        for (var i = 0; i < Items.Count; i++)
+        {
+            if (!string.IsNullOrWhiteSpace(Items[i].Id)) continue;
+            Items[i].Id = FromLegacyObject && i == 0 ? LegacyId : $"p{i}";
+        }
 
         var seen = new HashSet<string>(StringComparer.Ordinal);
         foreach (var c in Items)

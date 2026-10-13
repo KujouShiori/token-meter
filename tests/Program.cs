@@ -323,5 +323,28 @@ internal static class Program
         var trap = ProviderConfig.Parse(arr);
         Check("ProviderConfig.Parse 读数组会静默回默认值（已知陷阱，调用点必须走 Registry）",
             !trap.Enabled && string.IsNullOrEmpty(trap.BaseUrl), "行为变了，重新评估所有调用点");
+
+        // id 必须跨启动稳定：随机 id 会让云端账本每次重启都挂在一把对不上的钥匙下
+        var again = ProviderRegistry.Parse(legacy);
+        Check("同一份老配置两次解析得到同一个 id",
+            l1 is not null && again is not null && l1.Items[0].Id == again.Items[0].Id,
+            $"{l1?.Items[0].Id} vs {again?.Items[0].Id}");
+        Check("老配置固定用 legacy-primary 这个 id",
+            again is not null && again.Items[0].Id == ProviderRegistry.LegacyId, again?.Items[0].Id);
+        Check("标记出这是从单个对象迁移来的", again is { FromLegacyObject: true }, "没标记");
+
+        var noIdArr = "[{\"DisplayName\":\"A\"},{\"DisplayName\":\"B\"}]";
+        var s1 = ProviderRegistry.Parse(noIdArr);
+        var s2 = ProviderRegistry.Parse(noIdArr);
+        Check("数组里缺 id 的条目按位置得到稳定 id",
+            s1 is not null && s2 is not null
+            && s1.Items[0].Id == s2.Items[0].Id && s1.Items[1].Id == s2.Items[1].Id
+            && s1.Items[0].Id != s1.Items[1].Id,
+            s1 is null ? "null" : $"{s1.Items[0].Id}/{s1.Items[1].Id}");
+
+        var explicitId = "[{\"Id\":\"mine-1\",\"DisplayName\":\"A\"}]";
+        var e1 = ProviderRegistry.Parse(explicitId);
+        Check("已有显式 id 的不被改动", e1 is not null && e1.Items[0].Id == "mine-1", e1?.Items[0].Id);
+        Check("显式 id 的条目不算老配置迁移", e1 is { FromLegacyObject: false }, "不该标 legacy");
     }
 }
