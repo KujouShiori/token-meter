@@ -31,6 +31,10 @@ public sealed class TokenMeterPlugin : IslandPluginBase
     private ProviderState _providerState = new();
     private string _cacheDir = string.Empty;
 
+    /// <summary>上一次成功读到的接口列表。配置读不通时沿用它，并拒绝写回。</summary>
+    private List<ProviderConfig> _providersLastGood = new();
+    private bool _providersReadable = true;
+
     private readonly SemaphoreSlim _gate = new(1, 1);
     private CancellationTokenSource _cts = new();
     private bool _stopped;
@@ -179,7 +183,9 @@ public sealed class TokenMeterPlugin : IslandPluginBase
             var token = _cts.Token;
 
             Snapshot snap;
-            var providerJson = Settings.Get("provider", string.Empty);
+            // 接口列表必须在调用线程读：LoadProviders 里要碰宿主设置，
+            // 而后台线程读设置是这类插件出 COMException 的经典位置（原来也是「外面读、里面解析」）
+            var providers = LoadProviders();
             try
             {
                 snap = await Task.Run(async () =>
@@ -190,7 +196,7 @@ public sealed class TokenMeterPlugin : IslandPluginBase
                     var local = _scanner.Scan(roots, token);
                     if (!_stopped) _scanner.SaveCache();
 
-                    var cfg = ProviderConfig.Parse(providerJson);
+                    var cfg = providers[0];
                     if (!cfg.Enabled)
                     {
                         // 用户主动关掉接口：不能拿旧的服务端数据去压制本地日志
@@ -462,7 +468,7 @@ public sealed class TokenMeterPlugin : IslandPluginBase
 
     private void OnProviderConfigChanged()
     {
-        var cfg = ProviderConfig.Parse(Settings.Get("provider", string.Empty));
+        var cfg = LoadProviders()[0];
         if (!cfg.Enabled)
         {
             // 关掉接口就不能再拿旧的服务端数据压制本地日志
@@ -505,7 +511,7 @@ public sealed class TokenMeterPlugin : IslandPluginBase
     private void RecomputeFromLedger(string reason)
     {
         var pricing = PricingConfig.Parse(Settings.Get("pricing", string.Empty));
-        var cfg = ProviderConfig.Parse(Settings.Get("provider", string.Empty));
+        var cfg = LoadProviders()[0];
         UsageLedger? local;
         lock (_ledgerLock) { local = _lastLedger; }
 
@@ -754,7 +760,7 @@ public sealed class TokenMeterPlugin : IslandPluginBase
         page.Children.Add(Card(moneyRow));
 
         // ---- 服务端用量接口（优先于本地日志，失败自动降级）----
-        var prov = ProviderConfig.Parse(Settings.Get("provider", string.Empty));
+        var prov = LoadProviders()[0];
 
         page.Children.Add(new TextBlock
         {
@@ -860,11 +866,20 @@ public sealed class TokenMeterPlugin : IslandPluginBase
                 jsonStatus.Text = "JSON 格式不对，没有保存：" + ex.Message;
                 return;
             }
-            var cfg = ProviderConfig.Parse(text);
-            var normalized = cfg.ToJson();
-            if (string.Equals(normalized, Settings.Get("provider", string.Empty), StringComparison.Ordinal)) return;
-            Settings.Set("provider", normalized);
-            jsonBox.Text = normalized;                     // 回填规范化后的内容，让用户看到默认值被补全了什么
+            // 这个框编辑的是「当前这一个接口」，不是整份存储：存储是数组，
+            // 直接整键写回会把其它接口抹掉，所以只替换列表第一项、并保住它的 id。
+            var edited = ProviderConfig.Parse(text);
+            var list = LoadProviders();
+            edited.Id = list[0].Id;
+            list[0] = edited;
+            if (string.Equals(new ProviderRegistry { Items = list }.ToJson(),
+                    Settings.Get("provider", string.Empty), StringComparison.Ordinal)) return;
+            if (!SaveProviders(list))
+            {
+                jsonStatus.Text = "接口配置当前读不通，为了不把原有配置覆盖掉，本次没有保存。";
+                return;
+            }
+            jsonBox.Text = edited.ToJson();                  // 回填规范化后的内容，让用户看到默认值被补全了什么
             jsonStatus.Text = "已保存并重新拉取。";
         }
         jsonBox.LostFocus += (_, _) => CommitProviderJson();
@@ -881,7 +896,7 @@ public sealed class TokenMeterPlugin : IslandPluginBase
             else
             {
                 // 每次展开都从设置里重读，避免刚才用上面那些单字段框改过之后看到旧内容
-                jsonBox.Text = ProviderConfig.Parse(Settings.Get("provider", string.Empty)).ToJson();
+                jsonBox.Text = LoadProviders()[0].ToJson();
                 jsonBox.Visibility = Visibility.Visible;
                 jsonToggle.Content = "保存并收起";
                 jsonBox.Focus(FocusState.Programmatic);
@@ -904,11 +919,14 @@ public sealed class TokenMeterPlugin : IslandPluginBase
 
             var preset = ProviderPresets.All[idx];
             var cfg = preset.Build();
-            cfg.Enabled = ProviderConfig.Parse(Settings.Get("provider", string.Empty)).Enabled;
+            var list = LoadProviders();
+            cfg.Enabled = list[0].Enabled;   // 套用预设不改用户当前的联网开关
+            cfg.Id = list[0].Id;             // 也别弄丢身份，否则已积累的云端账本会成孤儿
             var alias = (provNameBox.Text ?? string.Empty).Trim();
             if (alias.Length > 0) cfg.DisplayName = alias;
 
-            Settings.Set("provider", cfg.ToJson());   // 触发 OnProviderConfigChanged → 重新拉取
+            list[0] = cfg;
+            SaveProviders(list);             // 触发 OnProviderConfigChanged → 重新拉取
 
             if (provToggle.IsOn != cfg.Enabled) provToggle.IsOn = cfg.Enabled;
             baseUrlBox.Text = cfg.BaseUrl;
@@ -1221,15 +1239,55 @@ public sealed class TokenMeterPlugin : IslandPluginBase
 
     // ---- 三个提交点：失焦 + 回车 + 动作前（§15.1）----
 
-    /// <summary>改一个配置字段：只在真的变了时写回，避免每次失焦都触发一轮重拉。</summary>
+    /// <summary>
+    /// 读接口列表。存储从"单个对象"改成"数组"之后，所有读写都必须走这里：
+    /// ProviderConfig.Parse 遇到数组会**静默返回默认值（Enabled=false）**，
+    /// 谁漏走一步，用户随手一保存就把已有的全部接口抹掉（这条已用断言钉住）。
+    /// 读不通时沿用上一次成功的副本并置 _providersReadable=false，
+    /// 因为保存是整键覆盖，拿默认值覆盖等于毁配置。
+    /// </summary>
+    private List<ProviderConfig> LoadProviders()
+    {
+        var reg = ProviderRegistry.Parse(Settings.Get("provider", string.Empty));
+        if (reg is null)
+        {
+            if (_providersReadable)
+                Log.Warn("接口配置读不通（JSON 损坏或结构不认识）：本轮沿用上一次成功读到的配置，并拒绝写回设置，避免抹掉原有配置");
+            _providersReadable = false;
+            return _providersLastGood.Count > 0
+                ? _providersLastGood
+                : new List<ProviderConfig> { new() { Id = ProviderRegistry.NewId() } };
+        }
+
+        if (reg.Items.Count == 0) reg.Items.Add(new ProviderConfig { Id = ProviderRegistry.NewId() });
+        _providersReadable = true;
+        _providersLastGood = reg.Items;
+        return reg.Items;
+    }
+
+    /// <summary>整键覆盖写回。返回 false 表示因为读不通而拒绝保存——调用方要照实反馈，
+    /// 不能对着用户说"已保存"。</summary>
+    private bool SaveProviders(List<ProviderConfig> list)
+    {
+        if (!_providersReadable)
+        {
+            Log.Warn("接口配置当前读不通，已拒绝本次保存，以免覆盖掉原有配置");
+            return false;
+        }
+        Settings.Set("provider", new ProviderRegistry { Items = list }.ToJson());   // 触发 OnProviderConfigChanged
+        return true;
+    }
+
+    /// <summary>改一个配置字段：只在真的变了时写回，避免每次失焦都触发一轮重拉。
+    /// 目前编辑对象固定是列表第一个接口，接口选择器是下一步的事。</summary>
     private void SetProvider(Action<ProviderConfig> mutate)
     {
-        var cfg = ProviderConfig.Parse(Settings.Get("provider", string.Empty));
-        var before = cfg.ToJson();
-        mutate(cfg);
-        var after = cfg.ToJson();
-        if (string.Equals(before, after, StringComparison.Ordinal)) return;
-        Settings.Set("provider", after);   // 触发 OnProviderConfigChanged
+        var list = LoadProviders();
+        var target = list[0];
+        var before = target.ToJson();
+        mutate(target);
+        if (string.Equals(before, target.ToJson(), StringComparison.Ordinal)) return;
+        SaveProviders(list);
     }
 
     private static TextBox MakeLine(string header, string text, string placeholder, double minWidth)
