@@ -1138,6 +1138,27 @@ public sealed class TokenMeterPlugin : IslandPluginBase
         {
             var list = LoadProviders();
             var cur = Editing(list);
+
+            // 删除是这里唯一不可逆的动作：它会连带清掉那份接口的云端账本。
+            // 一点就删已经造成过一次事故，所以改成两段式确认，第二次点击才真删。
+            var armed = (delProvider.Tag as string) == cur.Id;
+            if (!armed)
+            {
+                if (list.Count <= 1)
+                {
+                    pickerStatus.Text = "只剩一个接口了：要停用请直接用上面的开关，不要用删除。";
+                    return;
+                }
+                delProvider.Tag = cur.Id;
+                delProvider.Content = $"确认删除「{LabelOf(cur)}」？";
+                pickerStatus.Text = "删除会连带清掉这个接口已积累的云端账本，且无法撤销。"
+                    + "要停用请改用上面的开关。再点一次这个按钮才执行删除。";
+                return;
+            }
+
+            delProvider.Tag = null;
+            delProvider.Content = "删除此接口";
+
             if (list.Count <= 1)
             {
                 pickerStatus.Text = "只剩一个接口了：要停用请直接用上面的开关，不要用删除。";
@@ -1159,8 +1180,9 @@ public sealed class TokenMeterPlugin : IslandPluginBase
             _states.DropOrphans(list.Select(p => p.Id));
             SaveStates();
 
+            _editingId = list[0].Id;
             RefillProviderFields();
-            pickerStatus.Text = $"已删除「{cur.DisplayName}」以及它那份云端账本。";
+            pickerStatus.Text = $"已删除「{LabelOf(cur)}」以及它那份云端账本。";
         };
 
         // ---- 模型单价表 ----
