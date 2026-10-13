@@ -417,11 +417,19 @@ public sealed class TokenMeterPlugin : IslandPluginBase
         var lines = new List<string>();
         foreach (var p in serverBlock.Last7)
         {
-            var diff = p.ServerCost > 0
-                ? (int)Math.Round((double)(p.Cost - p.ServerCost) * 100.0 / (double)p.ServerCost)
-                : 0;
-            lines.Add($"  {p.Day:yyyy-MM-dd}｜{Format.Tokens(p.Total)} tok｜推算 {p.Cost:0.####}{cur}｜"
-                    + $"上报 {p.ServerCost:0.####}{cur}｜推算比上报 {(diff >= 0 ? "+" : "")}{diff}%");
+            // 没数据的日子不能印 0：0 会被读成「这一天花了 0 元」，跟「没有数据」是两回事
+            if (p.Total <= 0 && p.Cost == 0m && p.ServerCost == 0m)
+            {
+                lines.Add($"  {p.Day:yyyy-MM-dd}｜无数据");
+                continue;
+            }
+
+            var est = p.Cost > 0m ? p.Cost.ToString("0.####") + cur : "—";
+            var rep = p.ServerCost > 0m ? p.ServerCost.ToString("0.####") + cur : "—";
+            var diff = p.Cost > 0m && p.ServerCost > 0m
+                ? $"{(int)Math.Round((double)(p.Cost - p.ServerCost) * 100.0 / (double)p.ServerCost):+0;-0;0}%"
+                : "—";
+            lines.Add($"  {p.Day:yyyy-MM-dd}｜{Format.Tokens(p.Total)} tok｜推算 {est}｜上报 {rep}｜推算比上报 {diff}");
         }
 
         Log.Info($"对账辅助（当前 InputIncludesCached={(cfg.InputIncludesCached ? "true" : "false")}）："
