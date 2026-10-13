@@ -842,7 +842,9 @@ public sealed class TokenMeterPlugin : IslandPluginBase
         page.Children.Add(Card(moneyRow));
 
         // ---- 服务端用量接口（优先于本地日志，失败自动降级）----
-        var prov = LoadProviders()[0];
+        var provList = LoadProviders();
+        var prov = Editing(provList);
+        if (string.IsNullOrEmpty(_editingId)) _editingId = prov.Id;   // 首次进设置页时定下编辑对象
 
         page.Children.Add(new TextBlock
         {
@@ -948,12 +950,13 @@ public sealed class TokenMeterPlugin : IslandPluginBase
                 jsonStatus.Text = "JSON 格式不对，没有保存：" + ex.Message;
                 return;
             }
-            // 这个框编辑的是「当前这一个接口」，不是整份存储：存储是数组，
-            // 直接整键写回会把其它接口抹掉，所以只替换列表第一项、并保住它的 id。
+            // 这个框编辑的是「当前选中的那一个接口」，不是整份存储：存储是数组，
+            // 直接整键写回会把其它接口抹掉，所以只替换当前那一条、并保住它的 id。
             var edited = ProviderConfig.Parse(text);
             var list = LoadProviders();
-            edited.Id = list[0].Id;
-            list[0] = edited;
+            var idx = list.IndexOf(Editing(list));
+            edited.Id = list[idx].Id;      // 编辑框里没有 id 概念，别让手改 JSON 把身份弄丢
+            list[idx] = edited;
             if (string.Equals(new ProviderRegistry { Items = list }.ToJson(),
                     Settings.Get("provider", string.Empty), StringComparison.Ordinal)) return;
             if (!SaveProviders(list))
@@ -978,7 +981,7 @@ public sealed class TokenMeterPlugin : IslandPluginBase
             else
             {
                 // 每次展开都从设置里重读，避免刚才用上面那些单字段框改过之后看到旧内容
-                jsonBox.Text = LoadProviders()[0].ToJson();
+                jsonBox.Text = Editing(LoadProviders()).ToJson();
                 jsonBox.Visibility = Visibility.Visible;
                 jsonToggle.Content = "保存并收起";
                 jsonBox.Focus(FocusState.Programmatic);
@@ -1002,12 +1005,13 @@ public sealed class TokenMeterPlugin : IslandPluginBase
             var preset = ProviderPresets.All[idx];
             var cfg = preset.Build();
             var list = LoadProviders();
-            cfg.Enabled = list[0].Enabled;   // 套用预设不改用户当前的联网开关
-            cfg.Id = list[0].Id;             // 也别弄丢身份，否则已积累的云端账本会成孤儿
+            var at = list.IndexOf(Editing(list));
+            cfg.Enabled = list[at].Enabled;   // 套用预设不改用户当前的联网开关
+            cfg.Id = list[at].Id;             // 也别弄丢身份，否则已积累的云端账本会成孤儿
             var alias = (provNameBox.Text ?? string.Empty).Trim();
             if (alias.Length > 0) cfg.DisplayName = alias;
 
-            list[0] = cfg;
+            list[at] = cfg;
             SaveProviders(list);             // 触发 OnProviderConfigChanged → 重新拉取
 
             if (provToggle.IsOn != cfg.Enabled) provToggle.IsOn = cfg.Enabled;
@@ -1360,12 +1364,20 @@ public sealed class TokenMeterPlugin : IslandPluginBase
         return true;
     }
 
+    /// <summary>设置页当前编辑的是哪个接口（按 id 定位，不按显示名——显示名可以重复）。
+    /// 找不到就退回列表第一个，保证任何时候都有编辑对象。</summary>
+    private string _editingId = string.Empty;
+
+    private ProviderConfig Editing(List<ProviderConfig> list)
+        => list.FirstOrDefault(p => p.Id == _editingId) ?? list[0];
+
     /// <summary>改一个配置字段：只在真的变了时写回，避免每次失焦都触发一轮重拉。
-    /// 目前编辑对象固定是列表第一个接口，接口选择器是下一步的事。</summary>
+    /// 目标永远是「当前选中的那个接口」，不是列表第一项。</summary>
     private void SetProvider(Action<ProviderConfig> mutate)
     {
         var list = LoadProviders();
-        var target = list[0];
+        var idx = list.IndexOf(Editing(list));
+        var target = list[idx];
         var before = target.ToJson();
         mutate(target);
         if (string.Equals(before, target.ToJson(), StringComparison.Ordinal)) return;
