@@ -26,6 +26,12 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- tests\ 是独立的 net10.0 控制台工程（自带 Main，且直接 Compile Include 本仓库源文件）。
+         默认编译通配会把它那些 .cs 卷进插件 dll，必须排掉。 -->
+    <Compile Remove="tests\**\*.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
     <!-- 插件 SDK 从 NuGet 装（主次版本 = 宿主 API 版本，当前 2.4.0）。
          ExcludeAssets="runtime"：WinIsland.Core.dll 由宿主提供，不能进插件包（市场 CI 会拒绝） -->
     <PackageReference Include="luolan.winland.Core" Version="2.4.0" PrivateAssets="all" ExcludeAssets="runtime" />
