@@ -233,17 +233,19 @@ public sealed class TokenMeterSpotlightView : UserControl
             if (b.IsSummary)
             {
                 // 余额型来源单独一行：它只有「此刻还剩多少」，没有今日/本周/累计，
-                // 硬套五格 KPI 会画出五个「—」，看起来像数据坏了
+                // 硬套五格 KPI 会画出五个「—」，看起来像数据坏了。
+                // 说明文字里不再出现"余额"二字 —— 那是用户自己起的名字里最可能带的词，
+                // 两边都写就成了"示例网关 余额 ｜ $ ｜ 余额（…）"。
                 wrap.Children.Add(new TextBlock
                 {
-                    Text = $"{b.Name} ｜ {b.Currency} ｜ 余额（某一刻的总额，不进按天统计与柱状图）"
+                    Text = $"{b.Name} ｜ {b.Currency} ｜ 某一刻的总额，不进按天统计与柱状图"
                          + (string.IsNullOrEmpty(b.AlertTag) ? string.Empty : " ｜ ⚠" + b.AlertTag),
                     FontSize = T(11),
                     Foreground = _faintBrush,
                 });
                 wrap.Children.Add(Kpi(
                     Format.Money(b.Currency, b.SummaryValue!.Value),
-                    "当前余额",
+                    "余额",
                     b.SummaryAtUtc is null ? null : $"{Format.Ago(b.SummaryAtUtc.Value)}读取"));
                 _kpiHost.Children.Add(wrap);
                 continue;
