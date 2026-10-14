@@ -56,15 +56,19 @@ dotnet build -c Release
 #    → tools/submit-plugin.ps1 -SourceDir bin/Release/... -Readme README.md -Logo logo.png -NoIndex
 ```
 
-logo.png 是**市场列表用的图标**（240×240 透明 PNG），它和 .lwp 平级放在市场的
-plugins/<id>/ 里，**不打进插件包** —— 所以本仓库只在根目录存一份，构建输出里不需要它。
+logo.png 是**市场列表用的图标**（240×240 透明 PNG），投稿时走 -Logo 参数，与 .lwp 平级放在市场的
+plugins/<id>/ 里，那一份是给市场列表看的。但还有另一份要如实知道：WinUI 的构建目标会把仓库根的 .png
+自动收成内容项，所以它同时以 TokenMeter/logo.png 的形式进入构建输出并被 .pri 索引 —— **包里确实带着它**
+（约 7 KB，插件运行时并不读它）。想让它彻底不进包，得在 csproj 里显式排掉，这是随时可做但目前没做的事。
 岛体上那个符号走的是 plugin.json 的 icon_glyph（Segoe 字形），与市场图标是两回事，
 换 logo 不影响岛上显示。
 
 ## 投稿市场与仓库的关系
 
-- **市场里装的版本 = 某个 releases/<版本号> 分支的头**，不是 main。
-  main 可以比市场超前（正在开发下一版），但市场里绝不能出现仓库没有对应 tag 的版本。
+- **市场里装的版本 = 市场仓库 plugins/<id>/ 里那份 .lwp**（宿主下载它，索引 index.json 用 sha256 锁定），
+  跟源码仓库的哪条分支都没有关系。releases/<版本号> 分支是**仓库侧的记账线**：给"市场那一版是从哪个提交构建的"
+  留一个可以继续提 bugfix 的地方，缺它不影响任何人安装。
+  真正要守的是下面这条：main 可以比市场超前（正在开发下一版），但**市场里绝不能出现仓库没有对应 tag 的版本**。
 - 投稿内容（plugins/<id>/）从对应 tag 构建，避免把 main 上未完成的改动一起打包出去。
 - 若官方审核要求改稿：在 releases/<版本号> 上改 → 重新构建 .lwp → 同一 PR 分支 push，
   PR 自动更新，不需要重开。
