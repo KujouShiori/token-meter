@@ -214,24 +214,54 @@ public sealed class ProviderConfig
         {
             var cfg = JsonSerializer.Deserialize<ProviderConfig>(json, JsonOpts);
             if (cfg is null) return new ProviderConfig();
-            cfg.BaseUrl = (cfg.BaseUrl ?? string.Empty).Trim().TrimEnd('/');
-            cfg.Kind = (cfg.Kind ?? string.Empty).Trim();
-            cfg.BalanceField = (cfg.BalanceField ?? string.Empty).Trim();
-            if (!string.IsNullOrEmpty(cfg.Path) && !cfg.Path.StartsWith('/')) cfg.Path = "/" + cfg.Path;
-            cfg.WindowMaxDays = Math.Clamp(cfg.WindowMaxDays, 1, 366);
-            cfg.LagMinutes = Math.Clamp(cfg.LagMinutes, 0, 2880);
-            cfg.TimeoutSeconds = Math.Clamp(cfg.TimeoutSeconds, 2, 120);
-            cfg.ProviderBudgetSeconds = Math.Clamp(cfg.ProviderBudgetSeconds, 5, 300);
-            cfg.MaxPagesPerWindow = Math.Clamp(cfg.MaxPagesPerWindow, 1, 500);
-            cfg.MaxWindowsPerRun = Math.Clamp(cfg.MaxWindowsPerRun, 1, 200);
-            cfg.InitialBackfillDays = Math.Clamp(cfg.InitialBackfillDays, 1, 366);
-            cfg.LedgerKeepDays = Math.Clamp(cfg.LedgerKeepDays, 0, 3660);
+            cfg.Normalize();
             return cfg;
         }
         catch (Exception)
         {
             return new ProviderConfig();
         }
+    }
+
+    /// <summary>
+    /// 把一份刚从 JSON 反序列化出来的配置收拾成能安全使用的样子。
+    ///
+    /// 必须存在且必须被**每一条**读取路径调用：providers.json 走的是 ProviderRegistry 的
+    /// List&lt;ProviderConfig&gt; 直接反序列化，根本不经过 Parse —— 所以以前写在 Parse 里的
+    /// null 兜底和数值夹取对真实配置文件一条都没跑过。实测：文件里写 "BaseUrl": null、
+    /// "WindowMaxDays": 0、"MaxWindowsPerRun": 99999，全部原样进到运行时，
+    /// 而 WindowMaxDays=0 会让时间窗口切不出进度、一轮发出 MaxWindowsPerRun 次请求。
+    /// </summary>
+    public void Normalize()
+    {
+        BaseUrl = (BaseUrl ?? string.Empty).Trim().TrimEnd('/');
+        Path = (Path ?? string.Empty).Trim();
+        Kind = (Kind ?? string.Empty).Trim();
+        BalanceField = (BalanceField ?? string.Empty).Trim();
+        DisplayName = (DisplayName ?? string.Empty).Trim();
+        ApiKeyEnvVar = (ApiKeyEnvVar ?? string.Empty).Trim();
+        AuthHeader = (AuthHeader ?? string.Empty).Trim();
+        AuthPrefix ??= string.Empty;
+        ModelFallback = string.IsNullOrWhiteSpace(ModelFallback) ? "服务端汇总" : ModelFallback.Trim();
+        Currency = string.IsNullOrWhiteSpace(Currency) ? "$" : Currency.Trim();
+        Id = (Id ?? string.Empty).Trim();
+
+        if (!string.IsNullOrEmpty(Path) && !Path.StartsWith('/')) Path = "/" + Path;
+
+        WindowMaxDays = Math.Clamp(WindowMaxDays, 1, 366);
+        LagMinutes = Math.Clamp(LagMinutes, 0, 2880);
+        TimeoutSeconds = Math.Clamp(TimeoutSeconds, 2, 120);
+        ProviderBudgetSeconds = Math.Clamp(ProviderBudgetSeconds, 5, 300);
+        MaxPagesPerWindow = Math.Clamp(MaxPagesPerWindow, 1, 500);
+        MaxWindowsPerRun = Math.Clamp(MaxWindowsPerRun, 1, 200);
+        InitialBackfillDays = Math.Clamp(InitialBackfillDays, 1, 366);
+        LedgerKeepDays = Math.Clamp(LedgerKeepDays, 0, 3660);
+        UndercountWarnPercent = Math.Clamp(UndercountWarnPercent, 0, 99);
+        if (double.IsNaN(CostUnitDivisor) || double.IsInfinity(CostUnitDivisor) || CostUnitDivisor <= 0) CostUnitDivisor = 1;
+        if (double.IsNaN(CostScale) || double.IsInfinity(CostScale) || CostScale <= 0) CostScale = 1;
+        if (double.IsNaN(ValueScale) || double.IsInfinity(ValueScale) || ValueScale <= 0) ValueScale = 1;
+        if (double.IsNaN(DailyBudget) || double.IsInfinity(DailyBudget) || DailyBudget < 0) DailyBudget = 0;
+        if (double.IsNaN(BalanceWarnBelow) || double.IsInfinity(BalanceWarnBelow) || BalanceWarnBelow < 0) BalanceWarnBelow = 0;
     }
 
     public string ToJson() => JsonSerializer.Serialize(this, JsonOpts);
@@ -509,7 +539,13 @@ public sealed class ProviderRegistry
                 {
                     var list = JsonSerializer.Deserialize<List<ProviderConfig>>(raw, JsonOpts);
                     if (list is null) return null;
+                    // 数组里写了个裸 null 会反序列化出一个 null 元素，遍历时直接把它筛掉 ——
+                    // 一条坏元素不该让整份配置判死（那样用户其它几家接口也读不到了）
+                    list.RemoveAll(x => x is null);
                     var reg = new ProviderRegistry { Items = list };
+                    // 每一条都要收拾：这里绕过了 ProviderConfig.Parse，不 Normalize 就等于
+                    // 用户写的 null 和越界数字直接进运行时
+                    foreach (var item in reg.Items) item.Normalize();
                     reg.EnsureIds();
                     return reg;
                 }
@@ -518,6 +554,7 @@ public sealed class ProviderRegistry
                     var one = JsonSerializer.Deserialize<ProviderConfig>(raw, JsonOpts);
                     if (one is null) return null;
                     var reg = new ProviderRegistry { FromLegacyObject = true };
+                    one.Normalize();
                     reg.Items.Add(one);
                     reg.EnsureIds();
                     return reg;

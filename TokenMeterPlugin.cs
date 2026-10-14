@@ -47,6 +47,14 @@ public sealed class TokenMeterPlugin : IslandPluginBase
     /// 而后台线程读宿主设置是这类插件出 COMException 的经典位置，所以只在调用线程读一次。</summary>
     private string _chartMode = ChartLayout.Grouped;
 
+    /// <summary>本地日志的模型范围与今日预算，同上：只在调用线程读，ComposeSnapshot 用缓存值。</summary>
+    private string _localScopeText = string.Empty;
+    private double _localBudget;
+
+    /// <summary>「清空缓存并完整重扫」的请求标记。真正的清空在 RefreshAsync 里做 ——
+    /// 那里持有 _gate；在 UI 线程上直接 clear 会和正在跑的后台拉取撞同一批字典。</summary>
+    private int _rescanRequested;
+
     private readonly SemaphoreSlim _gate = new(1, 1);
     private CancellationTokenSource _cts = new();
     private bool _stopped;
@@ -91,14 +99,9 @@ public sealed class TokenMeterPlugin : IslandPluginBase
         Context.Register(Context.OnSettingsChanged("priority", OnPriorityChanged));
         Context.Register(Context.OnSettingsChanged("pricing", OnPricingChanged));
         Context.Register(Context.OnSettingsChanged("roots", () => _ = RefreshAsync("数据目录变更")));
-        Context.Register(Context.OnSettingsChanged("localScope", () => RecomputeFromLedger("模型归属变更")));
-        Context.Register(Context.OnSettingsChanged("localBudget", () => RecomputeFromLedger("本地预算变更")));
-        Context.Register(Context.OnSettingsChanged("chartMode", () =>
-        {
-            // 这里在 UI 线程的设置回调里，读设置是安全的；刷新那条路径才需要缓存成字段
-            _chartMode = ChartLayout.NormalizeMode(Settings.Get("chartMode", ChartLayout.Grouped));
-            RecomputeFromLedger("图表画法变更");
-        }));
+        Context.Register(Context.OnSettingsChanged("localScope", () => _ = RecomputeAsync("模型归属变更")));
+        Context.Register(Context.OnSettingsChanged("localBudget", () => _ = RecomputeAsync("本地预算变更")));
+        Context.Register(Context.OnSettingsChanged("chartMode", () => _ = RecomputeAsync("图表画法变更")));
         // provider 键不再监听：接口配置已搬到 providers.json，由心跳查文件变化
         Context.Register(Context.OnSettingsChanged("refreshSeconds", () => { _secondsSinceRefresh = 0; }));
 
@@ -119,6 +122,12 @@ public sealed class TokenMeterPlugin : IslandPluginBase
         SetContent(null);
         try { Context.Island.CloseSpotlight(); } catch (Exception ex) { Log.Warn($"收起聚光卡失败（已忽略）：{ex.Message}"); }
         _spotlightView = null;
+        // 复用的 HttpClient 在这里一次性释放（以前每轮新建，靠 using 顺手关掉）
+        foreach (var client in _clients.Values)
+        {
+            try { client.Dispose(); } catch (Exception) { }
+        }
+        _clients.Clear();
         return Task.CompletedTask;
     }
 
@@ -161,21 +170,30 @@ public sealed class TokenMeterPlugin : IslandPluginBase
 
     private void OnTick()
     {
-        _secondsSinceRefresh++;
-
-        // 手改了配置文件就自动生效，不要求用户去点按钮。这里只比一次时间戳，很便宜。
-        if (!_busy && ProvidersFileChanged())
+        // 心跳是宿主直接调的：这里漏一个异常出去，累计几次就会被宿主自动停用（技能 §15 的硬规则）。
+        // 心跳本身没有必须让调用方知道的失败，所以整段兜住、只写日志。
+        try
         {
-            _secondsSinceRefresh = 0;
-            _ = RefreshAsync("配置文件已修改");
-            return;
+            _secondsSinceRefresh++;
+
+            // 手改了配置文件就自动生效，不要求用户去点按钮。这里只比一次时间戳，很便宜。
+            if (!_busy && ProvidersFileChanged())
+            {
+                _secondsSinceRefresh = 0;
+                _ = RefreshAsync("配置文件已修改");
+                return;
+            }
+
+            var interval = Math.Max(10, Settings.Get("refreshSeconds", 60));
+            if (_secondsSinceRefresh >= interval && !_busy)
+            {
+                _secondsSinceRefresh = 0;
+                _ = RefreshAsync("定时刷新");
+            }
         }
-
-        var interval = Math.Max(10, Settings.Get("refreshSeconds", 60));
-        if (_secondsSinceRefresh >= interval && !_busy)
+        catch (Exception ex)
         {
-            _secondsSinceRefresh = 0;
-            _ = RefreshAsync("定时刷新");
+            Log.Warn($"心跳出错（已忽略，下一轮继续）：{ex.Message}");
         }
     }
 
@@ -204,6 +222,8 @@ public sealed class TokenMeterPlugin : IslandPluginBase
             // 真正的取数入口重新读设置，不用初始化时缓存的字段（§15.1）
             var rootsText = Settings.Get("roots", string.Empty);
             var pricingJson = Settings.Get("pricing", string.Empty);
+            _localScopeText = Settings.Get("localScope", string.Empty);
+            _localBudget = ReadAmountSetting("localBudget");
             _chartMode = ChartLayout.NormalizeMode(Settings.Get("chartMode", ChartLayout.Grouped));
             var roots = UsageScanner.ResolveRoots(rootsText);
             var pricing = PricingConfig.Parse(pricingJson);
@@ -220,6 +240,23 @@ public sealed class TokenMeterPlugin : IslandPluginBase
                 snap = await Task.Run(async () =>
                 {
                     token.ThrowIfCancellationRequested();
+
+                    // 「完整重扫」是在这里落地的，不是在按钮处理器里 —— 此刻 _gate 已经拿着，
+                    // 后台拉取不可能同时改这些字典。在 UI 线程上直接 clear 会撞车：
+                    // Dictionary 并发写不抛异常也不一定报错，可能只是把内部桶结构弄坏，
+                    // 之后某次枚举无限循环或读到半截数据，那种失败比崩掉更难查。
+                    if (Interlocked.Exchange(ref _rescanRequested, 0) == 1)
+                    {
+                        lock (_ledgerLock) { _lastLedger = null; }
+                        _scanner.ForgetCache();
+                        _serverLedgers.Clear();
+                        _coveredUntil.Clear();
+                        _balances.Clear();
+                        _lastAlertNote = string.Empty;
+                        _states = new MultiProviderState();
+                        SaveStates();
+                        Log.Info("已清空扫描缓存与云端同步状态，开始从头重扫");
+                    }
 
                     // 本地日志始终先扫：它既是默认数据源，也是接口挂掉时的兜底
                     var local = _scanner.Scan(roots, token);
@@ -366,7 +403,7 @@ public sealed class TokenMeterPlugin : IslandPluginBase
                     ModelScope.Parse(p.ModelScope), _coveredUntil.GetValueOrDefault(p.Id), p.UndercountWarnPercent));
 
             var (localPart, assigned, split) = LedgerSplitter.SplitMany(local, tuples,
-                ModelScope.Parse(Settings.Get("localScope", string.Empty)));
+                ModelScope.Parse(_localScopeText));
 
             localBlock = SnapshotBuilder.BuildBlock(localPart, pricing, "本地日志");
 
@@ -401,10 +438,10 @@ public sealed class TokenMeterPlugin : IslandPluginBase
         }
 
         // 本地块的预算走宿主设置，和 roots / localScope 同类：本地侧的旋钮不进 providers.json，
-        // 那个文件只管云端接口。预算按本地币种（单价配置里的那个）。
-        var localBudget = ReadAmountSetting("localBudget");
+        // 那个文件只管云端接口。值由调用线程读进 _localBudget —— ComposeSnapshot 在后台线程跑，
+        // 后台线程读宿主设置是这类插件出 COMException 的经典位置。
         (localBlock.AlertTag, localBlock.AlertDetail) = SourceAlert.ForBudget(
-            localBlock.Today.Cost, localBudget, "本地日志", localBlock.Currency);
+            localBlock.Today.Cost, _localBudget, "本地日志", localBlock.Currency);
 
         foreach (var p in balances)
         {
@@ -497,7 +534,7 @@ public sealed class TokenMeterPlugin : IslandPluginBase
         var pages = 0;
         long bytes = 0;
 
-        using var client = new ProviderClient(cfg.TimeoutSeconds);
+        var client = ClientFor(cfg.TimeoutSeconds);
         var deadline = nowUtc.AddSeconds(cfg.ProviderBudgetSeconds);
         var hitBudget = false;
         foreach (var (from, to) in plan)
@@ -545,7 +582,7 @@ public sealed class TokenMeterPlugin : IslandPluginBase
         var nowUtc = DateTime.UtcNow;
         var st = _states.For(cfg.Id);
 
-        using var client = new ProviderClient(cfg.TimeoutSeconds);
+        var client = ClientFor(cfg.TimeoutSeconds);
         var r = await client.FetchBalanceAsync(cfg, ct).ConfigureAwait(false);
 
         _balances[cfg.Id] = (r.Amount, nowUtc);
@@ -605,7 +642,8 @@ public sealed class TokenMeterPlugin : IslandPluginBase
     }
 
     /// <summary>读一个金额型设置。填错、留空、填 0 或负数一律当"不启用" ——
-    /// 一个手抖打错的预算线不该变成"任何用量都超预算"。</summary>
+    /// 一个手抖打错的预算线不该变成"任何用量都超预算"。
+    /// ⚠ 只能在调用线程（UI）上调，结果缓存进字段；不要在 ComposeSnapshot 里直接调它。</summary>
     private double ReadAmountSetting(string key)
     {
         var raw = (Settings.Get(key, string.Empty) ?? string.Empty).Trim();
@@ -628,6 +666,42 @@ public sealed class TokenMeterPlugin : IslandPluginBase
         else if (_lastAlertNote.Length > 0) Log.Info("阈值告警已解除，上一轮：" + _lastAlertNote);
 
         _lastAlertNote = joined;
+    }
+
+    /// <summary>
+    /// 取宿主主题里的样式资源。取不到就返回 null，让调用方退回自己设字号/字重 ——
+    /// 这些资源名是宿主内部的，不是 SDK 承诺的契约：以前这里是硬转换，
+    /// 而 SettingsCardStyle 那处几乎每一行设置都要用，宿主哪天改名或换主题字典，
+    /// 整个设置页就会在构建时抛异常打不开（插件最显眼的那半边直接没了）。
+    /// </summary>
+    private static Style? NamedStyle(string key)
+    {
+        try
+        {
+            return Application.Current.Resources.TryGetValue(key, out var res) ? res as Style : null;
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// 按超时值复用接口客户端。HttpClient 每次刷新都新建会累积 TIME_WAIT 连接，
+    /// 而它的超时是**每个实例**固定的，所以按超时秒数分档缓存，正好也保住"改了配置就换档"。
+    /// 只在持有 _gate 时调用，不需要额外加锁；停用时统一释放。
+    /// </summary>
+    private readonly Dictionary<int, ProviderClient> _clients = new();
+
+    private ProviderClient ClientFor(int timeoutSeconds)
+    {
+        var key = Math.Clamp(timeoutSeconds, 2, 120);
+        if (!_clients.TryGetValue(key, out var client))
+        {
+            client = new ProviderClient(key);
+            _clients[key] = client;
+        }
+        return client;
     }
 
     private void RememberProviderFailure(string id, string note)
@@ -710,7 +784,12 @@ public sealed class TokenMeterPlugin : IslandPluginBase
         try
         {
             Directory.CreateDirectory(_cacheDir);
-            File.WriteAllText(StatePathV2(), _states.ToJson());
+            // 必须 tmp + Move 原子替换：状态文件记着每个接口的云端账本和水位线，
+            // 写一半被打断（断电、宿主被强杀、并发写）会留下半个 JSON，
+            // 下次启动读不回来就等于把云端历史整份丢掉 —— 而用户只会看到"云端块是空的"。
+            var tmp = StatePathV2() + ".tmp";
+            File.WriteAllText(tmp, _states.ToJson());
+            File.Move(tmp, StatePathV2(), overwrite: true);
         }
         catch (Exception)
         {
@@ -718,22 +797,48 @@ public sealed class TokenMeterPlugin : IslandPluginBase
         }
     }
 
-    /// <summary>单价/目录变了但没重扫：直接用已有账本重算快照（很便宜，不必读盘）。</summary>
-    private void RecomputeFromLedger(string reason)
+    /// <summary>
+    /// 单价/目录/预算/画法变了但没重扫：直接用已有账本重算快照（很便宜，不必读盘）。
+    ///
+    /// 必须和 RefreshAsync 共用同一把闸门：设置回调在 UI 线程上，而后台那一轮正在写
+    /// _serverLedgers / _balances / _states。两个线程同时动一个 Dictionary，最坏情况不是抛异常
+    /// 而是把内部桶结构弄坏，之后某次枚举读到半截数据或转不出来 —— 那种故障比崩掉难查得多。
+    /// 宿主设置也只在调用线程读一次，等锁之后不再碰（后台线程读设置是这类插件出 COMException 的经典位置）。
+    /// </summary>
+    private async Task RecomputeAsync(string reason)
     {
+        _localScopeText = Settings.Get("localScope", string.Empty);
+        _localBudget = ReadAmountSetting("localBudget");
+        _chartMode = ChartLayout.NormalizeMode(Settings.Get("chartMode", ChartLayout.Grouped));
+
         var pricing = PricingConfig.Parse(Settings.Get("pricing", string.Empty));
+        var providers = LoadProviders();
         UsageLedger? local;
         lock (_ledgerLock) { local = _lastLedger; }
 
         if (local is null)
         {
-            RunOnUI(() => Apply(new Snapshot { Currency = pricing.Currency, Error = "还没有扫描结果" }));
+            RunOnUI(() => Apply(new Snapshot { Currency = pricing.Currency, Error = "还没有扫描结果", ChartMode = _chartMode }));
             return;
         }
 
-        var snap = ComposeSnapshot(local, pricing, LoadProviders(), string.Empty);
-        Log.Info($"重算快照（{reason}）：今日 {Format.Amount(snap.Today.Cost)}{snap.Currency}，{snap.Blocks.Count} 个来源");
-        RunOnUI(() => Apply(snap));
+        await _gate.WaitAsync().ConfigureAwait(false);
+        if (_stopped)
+        {
+            _gate.Release();
+            return;
+        }
+
+        try
+        {
+            var snap = ComposeSnapshot(local, pricing, providers, string.Empty);
+            Log.Info($"重算快照（{reason}）：今日 {Format.Amount(snap.Today.Cost)}{snap.Currency}，{snap.Blocks.Count} 个来源");
+            RunOnUI(() => Apply(snap));
+        }
+        finally
+        {
+            _gate.Release();
+        }
     }
 
     private Snapshot BuildFromLedgerLocked(PricingConfig pricing, string error)
@@ -801,7 +906,7 @@ public sealed class TokenMeterPlugin : IslandPluginBase
         Log.Info($"常驻优先级变更为 {Settings.Get("priority", 10)}");
     }
 
-    private void OnPricingChanged() => RecomputeFromLedger("单价变更");
+    private void OnPricingChanged() => _ = RecomputeAsync("单价变更");
 
     /// <summary>
     /// 设置页顶部状态行。按用户要求只留「时间 + 口径」与出事才说的告警；
@@ -831,11 +936,15 @@ public sealed class TokenMeterPlugin : IslandPluginBase
     {
         var page = new StackPanel { Spacing = 10, Padding = new Thickness(0, 4, 0, 12) };
 
-        page.Children.Add(new TextBlock
+        var titleStyle = NamedStyle("TitleTextBlockStyle");
+        var title = new TextBlock { Text = Manifest.Name, Style = titleStyle };
+        // 取不到样式才自己设：本地值会盖过样式里的 setter，所以有样式时**不能**顺手赋 0
+        if (titleStyle is null)
         {
-            Text = Manifest.Name,
-            Style = (Style)Application.Current.Resources["TitleTextBlockStyle"],
-        });
+            title.FontSize = 20;
+            title.FontWeight = Microsoft.UI.Text.FontWeights.SemiBold;
+        }
+        page.Children.Add(title);
 
         page.Children.Add(new TextBlock
         {
@@ -1188,16 +1297,10 @@ public sealed class TokenMeterPlugin : IslandPluginBase
             CommitRoots(rootsBox);
             CommitCurrency(currencyBox);
             CommitPer(perBox);
-            lock (_ledgerLock) { _lastLedger = null; }
-            _scanner.ForgetCache();
-            // 「完整重扫」必须连云端水位线一起清：否则水位线会遮住本该重拉的那段，
-            // 而“完整”两个字就是假的
-            _serverLedgers.Clear();
-            _coveredUntil.Clear();
-            _balances.Clear();
-            _states = new MultiProviderState();
-            SaveStates();
-            Status("已清空缓存（含云端水位线），正在从头重扫…（第一次会慢）");
+            // 只立标记，不在这里 clear —— 真正的清空在 RefreshAsync 里（持有 _gate）做，
+            // 否则会和正在跑的后台拉取撞同一批字典
+            Interlocked.Exchange(ref _rescanRequested, 1);
+            Status("已排队清空缓存（含云端水位线），正在从头重扫…（第一次会慢）");
             _ = RefreshAsync("手动完整重扫");
         };
 
@@ -1377,11 +1480,15 @@ public sealed class TokenMeterPlugin : IslandPluginBase
     private static string Num(decimal v)
         => v == 0m ? "0" : v.ToString("0.################", System.Globalization.CultureInfo.InvariantCulture);
 
-    private Border Card(UIElement child) => new()
+    private Border Card(UIElement child)
     {
-        Style = (Style)Application.Current.Resources["SettingsCardStyle"],
-        Child = child,
-    };
+        var style = NamedStyle("SettingsCardStyle");
+        var card = new Border { Child = child, Style = style };
+        // 这个样式几乎每一行设置都要用。取不到时给一点内边距让页面仍然可读，
+        // 而不是在这里抛异常把整个设置页带走
+        if (style is null) card.Padding = new Thickness(12, 8, 12, 8);
+        return card;
+    }
 
     // ---- 三个提交点：失焦 + 回车 + 动作前（§15.1）----
 

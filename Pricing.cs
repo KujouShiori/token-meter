@@ -67,6 +67,17 @@ public sealed class PricingConfig
             cfg.Models.RemoveAll(m => string.IsNullOrWhiteSpace(m.Model));
             if (string.IsNullOrWhiteSpace(cfg.Currency)) cfg.Currency = "¥";
             if (cfg.PerTokens <= 0) cfg.PerTokens = 1_000_000;
+            // 单价和基数都是用户输入，得夹住：费用是 (token × 单价) 的 decimal 累加，
+            // 填个 1e25 进去乘法就 OverflowException，而它抛在算快照的路上 ——
+            // 一整轮刷新白跑，界面还会退回上一次的数据。真实价目表不可能接近这个量级。
+            foreach (var m in cfg.Models)
+            {
+                m.Input = ClampPrice(m.Input);
+                m.Output = ClampPrice(m.Output);
+                m.CacheRead = ClampPrice(m.CacheRead);
+                m.CacheWrite = ClampPrice(m.CacheWrite);
+            }
+            if (cfg.PerTokens > 1_000_000_000_000L) cfg.PerTokens = 1_000_000L;
             return cfg;
         }
         catch (Exception)
@@ -75,6 +86,9 @@ public sealed class PricingConfig
             return new PricingConfig();
         }
     }
+
+    /// <summary>单价允许到 1e12（含负数同宽），超出就夹住而不是报错。</summary>
+    private static decimal ClampPrice(decimal v) => Math.Clamp(v, -1_000_000_000_000m, 1_000_000_000_000m);
 
     public string ToJson() => JsonSerializer.Serialize(this, JsonOpts);
 

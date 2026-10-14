@@ -27,13 +27,24 @@ internal sealed class FileBucket
             byModel[model] = c.ToArray();
             return;
         }
-        if (arr.Length < 6) arr = new long[6];
+        // 槽位要和 Counters.ToArray / Counters.Add 对齐成 8 个：
+        // 原来只累加前 6 个，服务端金额与来源标记（第 7、8 槽）会被静默丢掉；
+        // 而且数组不够长时只是换了个局部变量，没写回字典 —— 这一轮加的数直接没了。
+        if (arr.Length < 8)
+        {
+            var grown = new long[8];
+            Array.Copy(arr, grown, arr.Length);
+            arr = grown;
+            byModel[model] = arr;
+        }
         arr[0] += c.Input;
         arr[1] += c.Output;
         arr[2] += c.CacheRead;
         arr[3] += c.CacheWrite;
         arr[4] += c.Total;
         arr[5] += c.Requests;
+        arr[6] += c.CostUnits;
+        if (c.Src != 0) arr[7] = c.Src;   // 来源标记是"覆盖"不是相加，与 Counters.Add 一致
     }
 
     public void Reset()

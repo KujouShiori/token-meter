@@ -28,6 +28,8 @@ internal static class Program
         UndercountTests();
         SplitManyTests();
         RegistryTests();
+        ConfigHardeningTests();
+        FileBucketTests();
         ChartLayoutTests();
         TableLayoutTests();
         AlertTests();
@@ -467,6 +469,83 @@ internal static class Program
             "永远返回 true 就是没在检查");
     }
 
+    // ---------------- 配置健壮性（null / 越界） ----------------
+
+    /// <summary>
+    /// providers.json 是用户手写的外部输入，而且它走的是 ProviderRegistry 直接反序列化，
+    /// **不经过 ProviderConfig.Parse** —— 那里原本的 null 兜底和数值夹取全都不会跑。
+    /// 这几条就是把这条通路钉住：写 null 不能崩，写 0 或天文数字不能变成死循环。
+    /// </summary>
+    private static void ConfigHardeningTests()
+    {
+        const string nasty = "[{\"Enabled\":true,\"BaseUrl\":null,\"Path\":null,\"ApiKeyEnvVar\":null,"
+                           + "\"ModelFallback\":null,\"DisplayName\":null,\"Kind\":null,\"BalanceField\":null,"
+                           + "\"WindowMaxDays\":0,\"MaxWindowsPerRun\":99999,\"MaxPagesPerWindow\":-5,"
+                           + "\"LagMinutes\":-100,\"InitialBackfillDays\":0,\"LedgerKeepDays\":-1}]";
+        var reg = ProviderRegistry.Parse(nasty);
+        Check("整份配置里全是 null 和越界值时也要能解析出来（不能整份判死）",
+            reg is { Items.Count: 1 }, "解析失败");
+        if (reg is not { Items.Count: 1 }) return;
+
+        var cfg = reg.Items[0];
+        var nullish = (cfg.BaseUrl is null ? "BaseUrl " : string.Empty)
+                    + (cfg.Path is null ? "Path " : string.Empty)
+                    + (cfg.ApiKeyEnvVar is null ? "ApiKeyEnvVar " : string.Empty)
+                    + (cfg.ModelFallback is null ? "ModelFallback " : string.Empty)
+                    + (cfg.DisplayName is null ? "DisplayName " : string.Empty);
+        Check("字符串字段为 null 时被规范成空串",
+            cfg.BaseUrl == "" && cfg.Path == "" && cfg.ApiKeyEnvVar == "" && cfg.DisplayName == "",
+            "还是 null：" + nullish);
+        // ModelFallback 故意不是空串：它是账本里的字典键，兜不住就会拿 null 当键抛异常
+        Check("模型名兜底值不能是空的（它是字典键）",
+            cfg.ModelFallback == "服务端汇总", $"实际「{cfg.ModelFallback}」");
+
+        Check("IsUsable 遇到 null 字段不抛异常",
+            !Throws(() => { var ok = cfg.IsUsable(out _); GC.KeepAlive(ok); }), "抛了：null 引用");
+        Check("Kind 为 null 时不算余额型也不抛",
+            !Throws(() => { var _ = cfg.IsBalance; }) && !cfg.IsBalance, "抛了");
+        Check("SafeSummary 遇到 null 字段不抛（设置页每次都要调它）",
+            !Throws(() => cfg.SafeSummary()), "抛了");
+
+        Check("WindowMaxDays 夹到至少 1 天（0 会让时间窗口切不出进度）",
+            cfg.WindowMaxDays >= 1, $"{cfg.WindowMaxDays}");
+        Check("MaxWindowsPerRun 有上限（否则一轮要发几万次请求）",
+            cfg.MaxWindowsPerRun <= 200, $"{cfg.MaxWindowsPerRun}");
+        Check("MaxPagesPerWindow / LagMinutes / InitialBackfillDays 的负值与 0 都被夹回可用区间",
+            cfg.MaxPagesPerWindow >= 1 && cfg.LagMinutes >= 0 && cfg.InitialBackfillDays >= 1,
+            $"pages={cfg.MaxPagesPerWindow} lag={cfg.LagMinutes} back={cfg.InitialBackfillDays}");
+
+        // 窗口规划不能因为越界配置变成死循环或一万个请求
+        var now = new DateTime(2026, 10, 14, 0, 0, 0, DateTimeKind.Utc);
+        Check("PlanWindows 在这种烂配置下仍然快速返回且有界",
+            !Throws(() => ProviderClient.PlanWindows(null, now, cfg))
+            && ProviderClient.PlanWindows(null, now, cfg).Count <= 200,
+            $"段数={ProviderClient.PlanWindows(null, now, cfg).Count}");
+
+        // 一条坏元素不该让整份配置判死
+        var mixed = ProviderRegistry.Parse("[null,{\"DisplayName\":\"好的那条\"}]");
+        Check("数组里混进裸 null 时只筛掉它，其它接口照常加载",
+            mixed is { Items.Count: 1 } && mixed.Items[0].DisplayName == "好的那条",
+            $"count={mixed?.Items.Count}");
+
+        // 单价也是用户输入，而且它会进到 decimal 乘法里
+        var wild = PricingConfig.Parse("{\"Currency\":\"\u00a5\",\"PerTokens\":1000000,"
+            + "\"Models\":[{\"Model\":\"M\",\"Input\":1e25,\"Output\":-1e25,\"CacheRead\":0,\"CacheWrite\":0}]}");
+        var big = new Counters { Input = 5_000_000_000, Output = 5_000_000_000, Total = 10_000_000_000 };
+        Check("天文数字的单价被夹住，算费用不会 decimal 溢出",
+            !Throws(() => wild.TryCost("M", big, out _)), "TryCost 抛了 OverflowException");
+        Check("夹住后仍然算得出一个有限费用",
+            wild.TryCost("M", big, out var wildCost) && wildCost < 1e24m,
+            $"cost={wildCost}");
+        Check("单价基数被填成荒谬值时退回默认，而不是把费用压成 0",
+            PricingConfig.Parse("{\"PerTokens\":99999999999999999999}").PerTokens == 1_000_000, "没退回来");
+    }
+
+    private static bool Throws(Action a)
+    {
+        try { a(); return false; } catch (Exception) { return true; }
+    }
+
     // ---------------- 近 7 天柱状图几何 ----------------
 
     /// <summary>
@@ -599,6 +678,45 @@ internal static class Program
         Check("主块的告警标签会拷到快照顶层（紧凑态读的就是顶层）", snap.AlertTag == "超预算", snap.AlertTag);
         Check("没有告警时标签是空串而不是 null（视图直接拼字符串）",
             new SourceBlock().AlertTag.Length == 0 && new Snapshot().AlertTag.Length == 0, "默认值不对");
+    }
+
+    // ---------------- 文件桶的槽位 ----------------
+
+    /// <summary>
+    /// 缓存桶存的是 Counters.ToArray() 那 8 个槽。原来 FileBucket.Add 只加前 6 个，
+    /// 服务端金额和来源标记会被静默丢掉；而且数组偏短时只换了局部变量、没写回字典，
+    /// 那一轮加的数直接没了。测试工程把 Scanner.cs 编进同一个程序集，所以能直接查 internal 类型。
+    /// </summary>
+    private static void FileBucketTests()
+    {
+        var b = new FileBucket();
+        b.Add("2026-10-14", "M", new Counters { Input = 100, Output = 10, Total = 110, Requests = 1, CostUnits = 5000, Src = 1 });
+        b.Add("2026-10-14", "M", new Counters { Input = 200, Output = 20, Total = 220, Requests = 1, CostUnits = 7000, Src = 1 });
+
+        var arr = b.Days["2026-10-14"]["M"];
+        Check("桶里存满 8 个槽", arr.Length == 8, $"长度={arr.Length}");
+        Check("输入/输出/合计/请求逐槽累加",
+            arr[0] == 300 && arr[1] == 30 && arr[4] == 330 && arr[5] == 2,
+            $"in={arr[0]} out={arr[1]} total={arr[4]} req={arr[5]}");
+        Check("服务端金额也累加（原来这条会被丢掉）", arr[6] == 12000, $"costUnits={arr[6]}");
+        Check("来源标记带得住", arr[7] == 1, $"src={arr[7]}");
+
+        var back = Counters.FromArray(arr);
+        Check("从桶里恢复出来的计数与累加结果一致",
+            back.Input == 300 && back.CostUnits == 12000 && back.FromServer && back.Total == 330,
+            $"in={back.Input} cost={back.CostUnits} src={back.Src}");
+
+        // 老缓存里可能只有 6 个槽：加完必须还在字典里，而不是写进一个被丢掉的数组
+        var legacy = new FileBucket();
+        legacy.Days["2026-10-14"] = new Dictionary<string, long[]>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["M"] = new long[] { 100, 10, 0, 0, 110, 1 },
+        };
+        legacy.Add("2026-10-14", "M", new Counters { Input = 50, Total = 50, Requests = 1 });
+        var grown = legacy.Days["2026-10-14"]["M"];
+        Check("6 槽的老数组会被撑到 8 槽并写回字典（原来换了局部变量就丢了）",
+            grown.Length == 8 && grown[0] == 150 && grown[4] == 160,
+            $"len={grown.Length} in={grown[0]} total={grown[4]}");
     }
 
     // ---------------- 近 7 天单日汇总 ----------------
