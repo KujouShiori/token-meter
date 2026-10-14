@@ -53,8 +53,13 @@ git push origin --delete feature/<主题>
 
 # 5) 构建投稿包并投稿市场（用官方脚本，索引由上游 CI 重建）
 dotnet build -c Release
-#    → tools/submit-plugin.ps1 -SourceDir bin/Release/... -Readme README.md -NoIndex
+#    → tools/submit-plugin.ps1 -SourceDir bin/Release/... -Readme README.md -Logo logo.png -NoIndex
 ```
+
+`logo.png` 是**市场列表用的图标**（240×240 透明 PNG），它和 `.lwp` 平级放在市场的
+`plugins/<id>/` 里，**不打进插件包** —— 所以本仓库只在根目录存一份，构建输出里不需要它。
+岛体上那个符号走的是 `plugin.json` 的 `icon_glyph`（Segoe 字形），与市场图标是两回事，
+换 logo 不影响岛上显示。
 
 ## 投稿市场与仓库的关系
 
