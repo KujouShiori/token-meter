@@ -241,7 +241,7 @@ public sealed class TokenMeterView : UserControl, IMorphView
             {
                 // 余额型来源：只有「此刻还剩多少」，套用量那套文案会写成「今日无 · 累计 ¥0」，既不对也读不懂。
                 // 这里刻意不再写"余额"两个字 —— 接口显示名是用户自己起的，他很可能会写成
-                // "XX 余额"，界面再补一遍就成了"示例网关 余额 余额 $249.9"。
+                // "XX 余额"，界面再补一遍就成了"示例网关 余额 余额 $99.9"。
                 // 行形本身就是区分：只有一笔钱 + 更新时间，没有 token 与今日/累计。
                 var at = b.SummaryAtUtc is null ? string.Empty : $"（{Format.Ago(b.SummaryAtUtc.Value)}更新）";
                 _otherHost.Children.Add(new TextBlock
