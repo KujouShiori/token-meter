@@ -347,9 +347,15 @@ public sealed class ProviderClient : IDisposable
             {
                 doc = JsonDocument.Parse(json);
             }
-            catch (JsonException ex)
+            catch (JsonException)
             {
-                throw new ProviderException($"返回不是合法 JSON：{ex.Message}", permanent: true);
+                // 网关 / CDN 出错时常见形态是 200 + 一段 HTML（登录页、502 页）。
+                // 直接把 .NET 的 "'<' is an invalid start of a value" 甩给用户没有信息量，换成人话。
+                var trimmed = json.TrimStart();
+                var why = trimmed.Length > 0 && trimmed[0] == '<'
+                    ? "接口返回的是网页而不是数据（站点可能在维护，或该端点被限流 / 需要重新登录）"
+                    : "接口返回的内容不是合法 JSON";
+                throw new ProviderException(why, permanent: true);
             }
 
             // 有些接口 key 不对也返回 HTTP 200，真正的问题在 body 的 code/msg：

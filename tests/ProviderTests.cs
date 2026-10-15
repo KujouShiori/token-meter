@@ -543,11 +543,29 @@ public static class ProviderTests
             {
                 client.FetchAsync(cfgBad, DateTime.UtcNow.AddDays(-1), DateTime.UtcNow, CancellationToken.None)
                       .GetAwaiter().GetResult();
-                Check("非 JSON 响应要抛 ProviderException", false, "没抛");
+                Check("HTML 响应要抛 ProviderException", false, "没抛");
             }
             catch (ProviderException ex)
             {
-                Check("非 JSON 响应报「返回不是合法 JSON」并算永久失败",
+                // 以 < 开头的响应体要说人话（站点在维护 / 被限流），不能甩 .NET 的 invalid start of a value
+                Check("HTML 响应报「返回的是网页」并算永久失败",
+                    ex.Permanent && ex.Message.Contains("网页") && !ex.Message.Contains("invalid start"), ex.Message);
+            }
+        }
+
+        var cfgBad2 = BaseCfg(prefix);
+        cfgBad2.Path = "/notjson";
+        using (var client = new ProviderClient(cfgBad2.TimeoutSeconds))
+        {
+            try
+            {
+                client.FetchAsync(cfgBad2, DateTime.UtcNow.AddDays(-1), DateTime.UtcNow, CancellationToken.None)
+                      .GetAwaiter().GetResult();
+                Check("非 HTML 的坏 body 也要抛 ProviderException", false, "没抛");
+            }
+            catch (ProviderException ex)
+            {
+                Check("非 HTML 的坏 body 报「不是合法 JSON」",
                     ex.Permanent && ex.Message.Contains("不是合法 JSON"), ex.Message);
             }
         }
@@ -712,6 +730,11 @@ public static class ProviderTests
             {
                 // 200 + 一段根本不是 JSON 的 HTML（网关登录页、CDN 报错页都是这个形态）
                 body = "<html><body>502 Bad Gateway</body></html>";
+            }
+            else if (path == "/notjson")
+            {
+                // 200 + 不以 < 开头的坏 body：走「不是合法 JSON」那条通用文案
+                body = "this is not json at all";
             }
             else if (path == "/badshape")
             {
