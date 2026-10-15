@@ -9,7 +9,10 @@ namespace TokenMeter;
 /// <summary>接口侧的可预期失败：调用方据此降级到本地日志，不当成崩溃。</summary>
 public sealed class ProviderException : Exception
 {
-    /// <summary>true = 权限/配置类问题，重试无意义，本轮直接降级并停手。</summary>
+    /// <summary>true = 权限/配置类问题，重试也解决不了。</summary>
+    /// <remarks>注意：目前**没有任何调用方读这个标志**，所以不存在"永久失败就退避或停用该来源"的机制 ——
+    /// 失败一律降级到本地日志，并且下一轮照样重试。上游瞬时 502 或返回 HTML 错误页时，正是靠这个持续重试自动恢复的。
+    /// 将来要接线，只对配置类错误降频；把所有永久失败都变成"不再尝试"会让一次瞬时故障把来源冻到下次重启。</remarks>
     public bool Permanent { get; }
 
     public ProviderException(string message, bool permanent = false) : base(message)
