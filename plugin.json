@@ -1,7 +1,7 @@
 {
   "id": "token-meter",
   "name": "Token 计岛",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "entry_dll": "TokenMeter.dll",
   "api_version": 2,
   "min_host_version": "2.4.0",
