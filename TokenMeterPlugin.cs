@@ -247,15 +247,13 @@ public sealed class TokenMeterPlugin : IslandPluginBase
                     // 之后某次枚举无限循环或读到半截数据，那种失败比崩掉更难查。
                     if (Interlocked.Exchange(ref _rescanRequested, 0) == 1)
                     {
+                        // 只清本地：云端账本与水位线是从接口取回来的，重读本地文件跟它们无关。
+                        // 以前连它们一起清，而重扫后只按 InitialBackfillDays 往回追，
+                        // 于是比这个窗口更早的云端天就永远回不来了（接口那边数据其实还在）。
                         lock (_ledgerLock) { _lastLedger = null; }
                         _scanner.ForgetCache();
-                        _serverLedgers.Clear();
-                        _coveredUntil.Clear();
-                        _balances.Clear();
                         _lastAlertNote = string.Empty;
-                        _states = new MultiProviderState();
-                        SaveStates();
-                        Log.Info("已清空扫描缓存与云端同步状态，开始从头重扫");
+                        Log.Info("已清空本地扫描缓存，开始从头重扫（云端账本与水位线保留）");
                     }
 
                     // 本地日志始终先扫：它既是默认数据源，也是接口挂掉时的兜底
@@ -1300,7 +1298,7 @@ public sealed class TokenMeterPlugin : IslandPluginBase
             // 只立标记，不在这里 clear —— 真正的清空在 RefreshAsync 里（持有 _gate）做，
             // 否则会和正在跑的后台拉取撞同一批字典
             Interlocked.Exchange(ref _rescanRequested, 1);
-            Status("已排队清空缓存（含云端水位线），正在从头重扫…（第一次会慢）");
+            Status("已排队清空本地扫描缓存，正在从头重扫…（第一次会慢，云端账本保留）");
             _ = RefreshAsync("手动完整重扫");
         };
 
